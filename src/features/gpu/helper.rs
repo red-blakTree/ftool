@@ -63,6 +63,8 @@ pub fn cleanup() -> Result<(), FtoolError> {
         UDEV_INTEGRATED_PATH,
         UDEV_PM_PATH,
         PRIME_DISCRETE_PATH,
+        // NVIDIA 独显模式环境变量配置
+        NV_ENV_PATH,
         // 兼容旧版配置的路径（用于清理升级前的遗留文件）
         "/etc/X11/xorg.conf",
         "/etc/X11/xorg.conf.d/11-nvidia-discrete.conf",
@@ -154,6 +156,16 @@ pub fn write_xorg_nvidia_config() -> Result<(), FtoolError> {
     let path = get_xorg_conf_path();
     info!("写入 X11 配置; path={}", path);
     create_file(path, XORG_CONF_NVIDIA_CONTENT, false)
+}
+
+/// 写入 NVIDIA 独显模式环境变量配置
+///
+/// 在 Nvidia 模式下写入 /etc/environment.d/ftool-nvidia.conf，
+/// 设置 __NV_PRIME_RENDER_OFFLOAD=1 和 __GLX_VENDOR_LIBRARY_NAME=nvidia，
+/// 确保应用默认使用 NVIDIA 渲染。
+pub fn write_nvidia_env_config() -> Result<(), FtoolError> {
+    info!("写入 NVIDIA 环境变量配置; path={}", NV_ENV_PATH);
+    create_file(NV_ENV_PATH, NV_ENV_CONTENT, false)
 }
 
 /// 启用或禁用 systemd 服务

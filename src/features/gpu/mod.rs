@@ -373,6 +373,9 @@ impl GpuController {
         // 写入 X11 PrimaryGPU 配置（参考 system76-power 的 discrete 模式）
         helper::write_xorg_nvidia_config()?;
 
+        // 写入 NVIDIA 环境变量配置，确保应用使用 NVIDIA 渲染
+        helper::write_nvidia_env_config()?;
+
         // 启用 nvidia-fallback 服务（参考 system76-power）
         if let Err(e) = helper::toggle_service("nvidia-fallback.service", true) {
             warn!("启用 nvidia-fallback 失败，继续执行; error={}", e);
