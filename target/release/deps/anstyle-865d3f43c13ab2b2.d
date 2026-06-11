@@ -1,0 +1,12 @@
+/home/chen/programme/works/rust/ftool/target/release/deps/anstyle-865d3f43c13ab2b2.d: /home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/lib.rs /home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/macros.rs /home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/color.rs /home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/effect.rs /home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/reset.rs /home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/style.rs
+
+/home/chen/programme/works/rust/ftool/target/release/deps/libanstyle-865d3f43c13ab2b2.rlib: /home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/lib.rs /home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/macros.rs /home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/color.rs /home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/effect.rs /home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/reset.rs /home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/style.rs
+
+/home/chen/programme/works/rust/ftool/target/release/deps/libanstyle-865d3f43c13ab2b2.rmeta: /home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/lib.rs /home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/macros.rs /home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/color.rs /home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/effect.rs /home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/reset.rs /home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/style.rs
+
+/home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/lib.rs:
+/home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/macros.rs:
+/home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/color.rs:
+/home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/effect.rs:
+/home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/reset.rs:
+/home/chen/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/anstyle-1.0.14/src/style.rs:
