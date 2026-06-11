@@ -23,7 +23,7 @@ function __fish_ftool_has_subcommand
     end
     # 如果碰到任何子命令则返回 0
     for cmd in $cmds
-        contains -- $cmd integrated compute hybrid nvidia query power switchable reset reset-sddm cache-create cache-delete cache-query
+        contains -- $cmd integrated compute hybrid nvidia query power switchable reset cache-create cache-delete cache-query
         and return 0
     end
     return 1
@@ -61,7 +61,6 @@ complete -c ftool -n "__fish_seen_subcommand_from -g; and not __fish_ftool_has_s
            power\t'运行时电源控制 (无需重启)'
            switchable\t'检测系统是否支持 GPU 切换'
            reset\t'还原 ftool 做出的所有修改'
-           reset-sddm\t'恢复 SDDM 的默认 Xsetup 文件'
            cache-create\t'创建显卡缓存'
            cache-delete\t'删除显卡缓存'
            cache-query\t'查询显卡缓存内容'"
@@ -72,10 +71,6 @@ complete -c ftool -n "__fish_seen_subcommand_from -g; and __fish_seen_subcommand
 
 # -g integrated / compute / hybrid / nvidia 的高级选项
 for __gpu_mode in integrated compute hybrid nvidia
-    complete -c ftool -n "__fish_seen_subcommand_from -g; and __fish_seen_subcommand_from $__gpu_mode" \
-        -l dm -r -a "gdm sddm lightdm" -d "手动指定显示管理器"
-    complete -c ftool -n "__fish_seen_subcommand_from -g; and __fish_seen_subcommand_from $__gpu_mode" \
-        -l force-comp -d "启用 ForceCompositionPipeline"
     complete -c ftool -n "__fish_seen_subcommand_from -g; and __fish_seen_subcommand_from $__gpu_mode" \
         -l coolbits -r -d "启用 Coolbits (默认值: 28)"
     complete -c ftool -n "__fish_seen_subcommand_from -g; and __fish_seen_subcommand_from $__gpu_mode" \

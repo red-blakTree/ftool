@@ -30,16 +30,13 @@ fn print_usage() {
   ext-display  检测外接显示器是否需要独显
   runtimepm    检测 GPU 是否支持运行时电源管理
   reset        还原 ftool 做出的所有修改
-  reset-sddm   恢复 SDDM 的默认 Xsetup 文件
   cache-create 创建显卡缓存 (在 hybrid/compute 模式下可用)
   cache-delete 删除显卡缓存
   cache-query  查询显卡缓存内容
 
 显卡高级选项 (仅在切换模式时使用):
   --rtd3 [0-3]               在 Hybrid 模式下启用 RTD3 电源管理 (默认值: 2)
-  --force-comp               在 Nvidia 模式下启用 ForceCompositionPipeline
   --coolbits [值]            在 Nvidia 模式下启用 Coolbits (默认值: 28)
-  --dm <gdm|sddm|lightdm>    手动指定显示管理器 (Nvidia 模式)
   --use-nvidia-current       使用 nvidia-current 内核模块
 "
     );

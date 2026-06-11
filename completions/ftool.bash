@@ -21,7 +21,7 @@ _ftool() {
             -H) has_H=1 ;;
             -h|--help) has_h=1 ;;
             -V|--version) has_V=1 ;;
-            integrated|compute|hybrid|nvidia|query|power|switchable|reset|reset-sddm|cache-create|cache-delete|cache-query)
+            integrated|compute|hybrid|nvidia|query|power|switchable|reset|cache-create|cache-delete|cache-query)
                 has_subcmd="$i" ;;
             md5|sha1|sha256|sha512) has_hash_algo=1 ;;
         esac
@@ -42,7 +42,7 @@ _ftool() {
                 ;;
             -g)
                 # 补全显卡操作
-                COMPREPLY=($(compgen -W "integrated compute hybrid nvidia query power switchable reset reset-sddm cache-create cache-delete cache-query" -- "$cur"))
+                COMPREPLY=($(compgen -W "integrated compute hybrid nvidia query power switchable reset cache-create cache-delete cache-query" -- "$cur"))
                 return
                 ;;
         esac
@@ -56,15 +56,11 @@ _ftool() {
         if [[ -n $has_g && -n $has_subcmd ]]; then
             # 检测前一个参数是否是显卡子命令，如果是则补全高级选项
             case "$prev" in
-                --dm)
-                    COMPREPLY=($(compgen -W "gdm sddm lightdm" -- "$cur"))
-                    return
-                    ;;
                 --coolbits|--rtd3)
                     # 数值参数，不做补全
                     return
                     ;;
-                --force-comp|--use-nvidia-current)
+                --use-nvidia-current)
                     # 布尔 flag，不需要额外参数
                     return
                     ;;
@@ -73,7 +69,7 @@ _ftool() {
                     local subcmd="${words[has_subcmd]}"
                     if [[ "$subcmd" =~ ^(integrated|compute|hybrid|nvidia)$ ]]; then
                         if [[ "$cur" == -* ]]; then
-                            COMPREPLY=($(compgen -W "--dm --force-comp --coolbits --rtd3 --use-nvidia-current" -- "$cur"))
+                            COMPREPLY=($(compgen -W "--coolbits --rtd3 --use-nvidia-current" -- "$cur"))
                             return
                         fi
                     elif [[ "$subcmd" == "power" ]]; then

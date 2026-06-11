@@ -17,23 +17,6 @@ pub enum SleepMode {
     S3,
 }
 
-/// 集成显卡厂商类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IgpuVendor {
-    Intel,
-    Amd,
-}
-
-impl IgpuVendor {
-    /// 返回厂商的字符串表示
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Intel => "intel",
-            Self::Amd => "amd",
-        }
-    }
-}
-
 /// GPU 设备信息（通过 sysfs 检测）
 #[derive(Debug)]
 struct GpuInfo {
@@ -278,152 +261,136 @@ impl GpuDetector {
 
     /// 查询当前 GPU 模式（通过 /proc/modules 和 PRIME 状态综合判断）
     pub fn query_current_mode() -> super::GpuMode {
-        // 方法1：检查已加载的内核模块
         let modules = fs::read_to_string("/proc/modules").unwrap_or_default();
-        let nvidia_loaded = modules.lines().any(|line| {
-            let name = line.split_whitespace().next().unwrap_or("");
-            name == "nvidia"
-                || name == "nvidia_drm"
-                || name == "nvidia_current"
-                || name == "nvidia_current_drm"
-        });
-        let nouveau_loaded = modules.lines().any(|line| {
-            let name = line.split_whitespace().next().unwrap_or("");
-            name == "nouveau"
-        });
+        let nvidia_loaded = Self::is_nvidia_module_loaded(&modules);
+        let nouveau_loaded = Self::is_nouveau_module_loaded(&modules);
+        let nvidia_drm_loaded = Self::is_nvidia_drm_module_loaded(&modules);
 
-        if !nvidia_loaded && !nouveau_loaded {
-            return super::GpuMode::Integrated;
-        }
+        let prime_mode = Self::read_prime_mode();
+        let is_integrated = Self::has_integrated_config();
+        let is_compute = Self::has_compute_modprobe_config();
+        let has_modeset = Self::has_modeset_config();
 
-        // 方法2：读取 PRIME 离散模式标志
-        let prime_mode = fs::read_to_string(PRIME_DISCRETE_PATH)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-
-        // 方法3：通过配置文件存在性判断
-        let has_integrated_config =
-            Path::new(MODPROBE_GPU_PATH).exists() && Path::new(UDEV_INTEGRATED_PATH).exists();
-        let has_modeset_config = Path::new(MODESET_PATH).exists();
-
-        // 配置与运行时状态不一致的检测
-        if has_integrated_config && nvidia_loaded {
-            warn!(
-                "配置/运行时不匹配: 存在 Integrated 模式的 modprobe 黑名单配置 \
-                但 nvidia 内核模块已加载（可能由其他软件或手动操作加载）"
-            );
-        }
-
-        // 综合判断
-        if has_integrated_config && !nvidia_loaded {
-            super::GpuMode::Integrated
-        } else if prime_mode == "on" {
-            // prime-discrete 标志为 "on"，由 ftool switch_mode 写入 → 独显模式
-            super::GpuMode::Nvidia
-        } else if prime_mode == "on-demand" || (has_modeset_config && nvidia_loaded) {
-            // 进一步区分 Compute 和 Hybrid
-            // Compute 模式下 nvidia-drm 被黑名单，不存在
-            let nvidia_drm_loaded = modules.lines().any(|line| {
-                let name = line.split_whitespace().next().unwrap_or("");
-                name == "nvidia_drm" || name == "nvidia_current_drm"
-            });
-            // 额外检查 modprobe 配置文件内容：Compute 模式会黑名单 nvidia-drm 但不黑名单 nvidia 核心
-            let has_compute_modprobe = Path::new(MODPROBE_GPU_PATH).exists()
-                && fs::read_to_string(MODPROBE_GPU_PATH)
-                    .map(|c| c.contains("blacklist nvidia-drm") && !c.contains("alias nvidia off"))
-                    .unwrap_or(false);
-            if (!nvidia_drm_loaded && prime_mode == "off") || has_compute_modprobe {
-                super::GpuMode::Compute
-            } else {
-                super::GpuMode::Hybrid
-            }
-        } else if nvidia_loaded {
-            super::GpuMode::Nvidia
-        } else {
-            super::GpuMode::Integrated
-        }
+        Self::classify_mode(
+            nvidia_loaded,
+            nouveau_loaded,
+            nvidia_drm_loaded,
+            &prime_mode,
+            is_integrated,
+            is_compute,
+            has_modeset,
+        )
     }
 
-    /// 检测 GPU 信息（通过 sysfs 直接读取，无需 lspci）
-    ///
-    /// # 参数
-    /// * `force_detect` - 强制从 sysfs 检测而非从缓存读取
-    ///
-    /// # 返回
-    /// `(nvidia_pci_bus_id, igpu_vendor)`
-    pub fn detect_gpu_info(force_detect: bool) -> Result<(String, IgpuVendor), FtoolError> {
-        debug!("开始检测 GPU 信息 (force_detect: {})", force_detect);
+// ========== 模式分类辅助函数 ==========
 
-        let (nvidia_gpus, amd_gpus, intel_gpus) = Self::detect_all_gpus()?;
+/// 检查 /proc/modules 中是否加载了 NVIDIA 核心模块
+fn is_nvidia_module_loaded(modules: &str) -> bool {
+    modules.lines().any(|line| {
+        let name = line.split_whitespace().next().unwrap_or("");
+        matches!(
+            name,
+            "nvidia" | "nvidia_drm" | "nvidia_current" | "nvidia_current_drm"
+        )
+    })
+}
 
-        let nvidia_pci_bus = if !nvidia_gpus.is_empty() {
-            // 取第一个 NVIDIA GPU 的 BusID
-            let raw_id = &nvidia_gpus[0].pci_id;
-            let bus_id = format_pci_bus_id(raw_id)?;
-            debug!("发现 NVIDIA GPU; raw={}, formatted={}", raw_id, bus_id);
-            Some(bus_id)
-        } else {
-            None
-        };
+/// 检查 /proc/modules 中是否加载了 NVIDIA DRM 模块
+fn is_nvidia_drm_module_loaded(modules: &str) -> bool {
+    modules.lines().any(|line| {
+        let name = line.split_whitespace().next().unwrap_or("");
+        matches!(name, "nvidia_drm" | "nvidia_current_drm")
+    })
+}
 
-        let igpu_vendor = if !intel_gpus.is_empty() {
-            debug!("发现 Intel 集显");
-            Some(IgpuVendor::Intel)
-        } else if !amd_gpus.is_empty() {
-            debug!("发现 AMD 集显");
-            Some(IgpuVendor::Amd)
-        } else {
-            None
-        };
+/// 检查 /proc/modules 中是否加载了 nouveau 开源驱动
+fn is_nouveau_module_loaded(modules: &str) -> bool {
+    modules.lines().any(|line| {
+        let name = line.split_whitespace().next().unwrap_or("");
+        name == "nouveau"
+    })
+}
 
-        let pci_bus = if force_detect {
-            nvidia_pci_bus.ok_or_else(|| {
-                warn!("强制检测模式下未找到 NVIDIA 显卡");
-                FtoolError::Gpu("未找到 NVIDIA 显卡，请先切换至 hybrid 模式！".into())
-            })
-        } else {
-            // 优先从缓存读取
-            match super::cache::GpuCache::read() {
-                Ok(data) => {
-                    info!(
-                        "从缓存读取 NVIDIA PCI 地址; cached_bus={}",
-                        data.nvidia_gpu_pci_bus
-                    );
-                    Ok(data.nvidia_gpu_pci_bus)
-                }
-                Err(_) => {
-                    warn!("缓存读取失败，尝试从 sysfs 获取");
-                    nvidia_pci_bus
-                        .ok_or_else(|| FtoolError::Gpu("无缓存数据且未找到 NVIDIA 显卡".into()))
-                }
-            }
-        }?;
+/// 读取 PRIME 离散模式标志文件内容
+fn read_prime_mode() -> String {
+    fs::read_to_string(PRIME_DISCRETE_PATH)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
 
-        let vendor = igpu_vendor.ok_or_else(|| {
-            warn!("未能检测到集成显卡厂商");
-            FtoolError::Gpu("无法检测集成显卡厂商".into())
-        })?;
+/// 检查是否存在 Integrated 模式的 udev 配置
+fn has_integrated_config() -> bool {
+    Path::new(MODPROBE_GPU_PATH).exists() && Path::new(UDEV_INTEGRATED_PATH).exists()
+}
 
-        Ok((pci_bus, vendor))
+/// 检查是否存在 modeset 配置文件
+fn has_modeset_config() -> bool {
+    Path::new(MODESET_PATH).exists()
+}
+
+/// 检查 modprobe 配置文件内容是否具有 Compute 模式特征
+///（黑名单 nvidia-drm 但不黑名单 nvidia 核心模块）
+fn has_compute_modprobe_config() -> bool {
+    Path::new(MODPROBE_GPU_PATH).exists()
+        && fs::read_to_string(MODPROBE_GPU_PATH)
+            .map(|c| c.contains("blacklist nvidia-drm") && !c.contains("alias nvidia off"))
+            .unwrap_or(false)
+}
+
+/// 综合分类当前 GPU 模式（纯决策函数，不涉及 I/O，便于测试）
+fn classify_mode(
+    nvidia_loaded: bool,
+    nouveau_loaded: bool,
+    nvidia_drm_loaded: bool,
+    prime_mode: &str,
+    is_integrated: bool,
+    is_compute: bool,
+    has_modeset: bool,
+) -> super::GpuMode {
+    // 无 NVIDIA 或 nouveau 模块 → Integrated
+    if !nvidia_loaded && !nouveau_loaded {
+        return super::GpuMode::Integrated;
     }
 
-    /// 获取 NVIDIA GPU 的 PCI Bus ID（格式化后的 "PCI:BB:DD:F" 格式）
-    ///
-    /// 当 `force_detect` 为 true 时直接从 sysfs 检测；
-    /// 为 false 时优先从缓存读取，缓存不可用时报错。
-    pub fn get_nvidia_pci_bus(force_detect: bool) -> Result<String, FtoolError> {
-        if !force_detect {
-            if let Ok(data) = super::cache::GpuCache::read() {
-                return Ok(data.nvidia_gpu_pci_bus);
-            }
-            return Err(FtoolError::Gpu(
-                "无缓存数据。此操作要求系统处于 hybrid 模式以创建缓存".into(),
-            ));
+    // Integrated 配置存在且 NVIDIA 未加载 → Integrated
+    if is_integrated && !nvidia_loaded {
+        return super::GpuMode::Integrated;
+    }
+
+    // 配置与运行时不一致告警
+    if is_integrated && nvidia_loaded {
+        warn!(
+            "配置/运行时不匹配: 存在 Integrated 模式的 modprobe 黑名单配置 \
+             但 nvidia 内核模块已加载（可能由其他软件或手动操作加载）"
+        );
+    }
+
+    // prime-discrete = "on" → Nvidia（需要 NVIDIA 模块实际已加载，避免残留文件误判）
+    if prime_mode == "on" {
+        if nvidia_loaded {
+            return super::GpuMode::Nvidia;
         }
-
-        Self::detect_gpu_info(true).map(|(bus, _)| bus)
+        debug!("prime-discrete=on 但 NVIDIA 模块未加载，视为残留配置");
     }
+
+    // prime_mode = "on-demand" 或有 modeset 配置 + NVIDIA 已加载
+    // → 根据 nvidia-drm 加载状态和 modprobe 配置区分 Compute/Hybrid
+    if prime_mode == "on-demand" || (has_modeset && nvidia_loaded) {
+        if (!nvidia_drm_loaded && prime_mode == "off") || is_compute {
+            return super::GpuMode::Compute;
+        }
+        return super::GpuMode::Hybrid;
+    }
+
+    // NVIDIA 已加载但无特征配置 → 默认 Nvidia
+    if nvidia_loaded {
+        return super::GpuMode::Nvidia;
+    }
+
+    // 默认 Integrated
+    super::GpuMode::Integrated
+}
 
     /// 获取 NVIDIA GPU 的原始 PCI 设备 ID（如 "0000:01:00.0"），用于运行时电源控制
     pub fn get_nvidia_raw_pci_id() -> Result<String, FtoolError> {
@@ -596,62 +563,3 @@ impl GpuDetector {
     }
 }
 
-/// 格式化 PCI Bus ID：将 "0000:01:00.0" 转为 "PCI:1:0:0"
-///
-/// 注意：PCI 域（Domain）前缀在转换中被丢弃，因为 Xorg 配置中的
-/// BusID 不需要域信息（`BusID "PCI:1:0:0"` 格式），且非零域在实际
-/// 硬件中极为罕见。如果需要域感知，应扩展此函数。
-///
-/// # 错误
-/// 当输入格式不符合预期时返回 `FtoolError::Gpu`。
-fn format_pci_bus_id(raw: &str) -> Result<String, FtoolError> {
-    // 格式: DDDD:BB:DD.F，移除域前缀（冒号前的内容）
-    let without_domain = raw.split_once(':').map(|(_, rest)| rest).unwrap_or(raw);
-    let parts: Vec<&str> = without_domain.split(':').collect();
-    if parts.len() != 2 {
-        return Err(FtoolError::Gpu(format!(
-            "PCI 设备 ID 格式异常，无法分割 BDF: {raw}"
-        )));
-    }
-    let bus = u32::from_str_radix(parts[0], 16)
-        .map_err(|_| FtoolError::Gpu(format!("PCI Bus 解析失败: {} (raw: {raw})", parts[0])))?;
-    let dev_func: Vec<&str> = parts[1].split('.').collect();
-    if dev_func.len() != 2 {
-        return Err(FtoolError::Gpu(format!(
-            "PCI 设备 ID 格式异常，无法分割 dev.func: {raw}"
-        )));
-    }
-    let dev = u32::from_str_radix(dev_func[0], 16)
-        .map_err(|_| FtoolError::Gpu(format!("PCI Dev 解析失败: {} (raw: {raw})", dev_func[0])))?;
-    let func = u32::from_str_radix(dev_func[1], 16)
-        .map_err(|_| FtoolError::Gpu(format!("PCI Func 解析失败: {} (raw: {raw})", dev_func[1])))?;
-    Ok(format!("PCI:{}:{}:{}", bus, dev, func))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_format_pci_bus_id_standard() {
-        assert_eq!(format_pci_bus_id("0000:01:00.0").unwrap(), "PCI:1:0:0");
-        assert_eq!(format_pci_bus_id("0000:0a:00.0").unwrap(), "PCI:10:0:0");
-        assert_eq!(format_pci_bus_id("0000:03:02.1").unwrap(), "PCI:3:2:1");
-    }
-
-    #[test]
-    fn test_format_pci_bus_id_edge_cases() {
-        // 高 bus 号
-        assert_eq!(format_pci_bus_id("0000:ff:1f.7").unwrap(), "PCI:255:31:7");
-        // 无需 trim "0000:" 前缀
-        assert_eq!(format_pci_bus_id("0001:01:00.0").unwrap(), "PCI:1:0:0");
-    }
-
-    #[test]
-    fn test_format_pci_bus_id_invalid() {
-        assert!(format_pci_bus_id("invalid").is_err());
-        assert!(format_pci_bus_id("").is_err());
-        assert!(format_pci_bus_id("0000:01:00").is_err());
-        assert!(format_pci_bus_id("0000:xx:00.0").is_err());
-    }
-}

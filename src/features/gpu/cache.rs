@@ -90,7 +90,7 @@ impl GpuCache {
         Ok(data)
     }
 
-    /// 删除缓存文件及其空父目录
+    /// 删除缓存文件
     pub fn delete() -> Result<(), FtoolError> {
         if Path::new(CACHE_FILE_PATH).exists() {
             debug!("删除缓存文件; path={}", CACHE_FILE_PATH);

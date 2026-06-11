@@ -1,7 +1,7 @@
 use crate::core::error::FtoolError;
 use crate::core::privilege::Privilege;
 use crate::features::gpu::{GpuController, GpuMode, NvidiaOptions, PowerAction, SwitchOptions};
-use log::info;
+use log::{info, warn};
 use std::ffi::OsString;
 
 /// 处理显卡相关命令（从 main.rs 提取，保持参数接口一致）
@@ -34,10 +34,6 @@ pub fn handle(args: &[OsString]) -> Result<(), FtoolError> {
         "reset" => {
             Privilege::ensure_root()?;
             GpuController::reset()
-        }
-        "reset-sddm" => {
-            Privilege::ensure_root()?;
-            GpuController::reset_sddm()
         }
         "cache-create" => {
             Privilege::ensure_root()?;
@@ -153,27 +149,14 @@ fn parse_switch_options(
     while i < args.len() {
         let arg = args[i].to_string_lossy();
         match arg.as_ref() {
-            "--dm" => {
-                if i + 1 < args.len() {
-                    let dm_val = args[i + 1].to_string_lossy();
-                    if !["gdm", "gdm3", "sddm", "lightdm"].contains(&dm_val.as_ref()) {
-                        return Err(FtoolError::Input(format!(
-                            "不支持的显示管理器: {} (支持: gdm, gdm3, sddm, lightdm)",
-                            dm_val
-                        )));
-                    }
-                    nv_opts.dm = Some(dm_val.into_owned());
-                    i += 2;
-                } else {
-                    return Err(FtoolError::Input("--dm 需要指定显示管理器".into()));
-                }
-            }
-            "--force-comp" => {
-                nv_opts.force_comp = true;
-                i += 1;
-            }
             "--coolbits" => {
                 let (val, next) = parse_u32_flag(args, i, "coolbits")?;
+                if val > 31 {
+                    return Err(FtoolError::Input(format!(
+                        "Coolbits 值必须在 0-31 之间（5-bit 位掩码），当前值: {}",
+                        val
+                    )));
+                }
                 nv_opts.coolbits = Some(val);
                 i = next;
             }
@@ -194,14 +177,21 @@ fn parse_switch_options(
     }
 
     info!(
-        "解析显卡切换参数完成; mode={}, dm={:?}, force_comp={}, coolbits={:?}, rtd3={:?}, use_nvidia_current={}",
+        "解析显卡切换参数完成; mode={}, coolbits={:?}, rtd3={:?}, use_nvidia_current={}",
         gpu_mode.as_str(),
-        nv_opts.dm,
-        nv_opts.force_comp,
         nv_opts.coolbits,
         nv_opts.rtd3,
         nv_opts.use_nvidia_current,
     );
+
+    // 非 nvidia 模式下使用 --coolbits 时发出警告
+    if gpu_mode != GpuMode::Nvidia && nv_opts.coolbits.is_some() {
+        warn!(
+            "--coolbits 仅在 nvidia 模式下生效，当前 {} 模式将忽略该选项",
+            gpu_mode.as_str()
+        );
+    }
+
     Ok(SwitchOptions {
         mode: gpu_mode,
         nvidia_opts: nv_opts,

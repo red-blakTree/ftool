@@ -28,9 +28,7 @@ ftool 是一个用 Rust 编写的系统级命令行工具，主要面向 **NVIDI
 在切换命令后可附加以下参数：
 
 - `--rtd3 <0-3>` —— 在 Hybrid 模式下启用 RTD3 运行时动态电源管理（默认值：2），级别越高省电效果越好
-- `--force-comp` —— 在 Nvidia 模式下启用 ForceCompositionPipeline，解决某些显示器的画面撕裂问题
 - `--coolbits <值>` —— 在 Nvidia 模式下启用 Coolbits 超频/调压选项（默认值：28）
-- `--dm <gdm|sddm|lightdm>` —— 手动指定显示管理器，仅在 Nvidia 模式下使用
 - `--use-nvidia-current` —— 使用 `nvidia-current` 内核模块替代默认的 `nvidia` 模块
 
 示例：
@@ -39,8 +37,8 @@ ftool 是一个用 Rust 编写的系统级命令行工具，主要面向 **NVIDI
 # 切换到 Hybrid 模式并启用 RTD3 级别 2
 sudo ftool -g hybrid --rtd3 2
 
-# 切换到 Nvidia 模式，指定 GDM 并启用 ForceCompositionPipeline
-sudo ftool -g nvidia --dm gdm --force-comp
+# 切换到 Nvidia 模式并启用 Coolbits
+sudo ftool -g nvidia --coolbits 28
 ```
 
 #### 电源控制
@@ -85,9 +83,6 @@ ftool -g default
 ```bash
 # 还原 ftool 做出的所有 GPU 配置修改（重启生效）
 sudo ftool -g reset
-
-# 恢复 SDDM 的默认 Xsetup 脚本
-sudo ftool -g reset-sddm
 ```
 
 ### 📦 GPU 缓存管理
@@ -221,7 +216,7 @@ ftool/
 - **Integrated**：通过 `modprobe.d` 黑名单禁用所有 NVIDIA 内核模块，通过 udev 规则在 PCI 设备出现时自动移除 NVIDIA 设备
 - **Compute**：黑名单仅禁用显示相关模块（nvidia-drm、nvidia-modeset），保留 nvidia 核心驱动和 nvidia-uvm 供 CUDA 使用
 - **Hybrid**：允许所有驱动正常加载，配置 modeset=1 和 RTD3 电源管理，通过 udev 规则实现运行时电源管理
-- **Nvidia**：将 NVIDIA 设为主 GPU，配置 Xorg OutputClass 或完整 Xorg 配置，根据显示管理器配置 xrandr 初始化脚本
+- **Nvidia**：将 NVIDIA 设为主 GPU，通过 modeset=1 配置 nvidia-drm 在 Wayland 下工作
 
 所有模式切换后会自动重建 initramfs（支持 dracut、update-initramfs、rpm-ostree）。
 
@@ -235,7 +230,6 @@ ftool 在 `/etc/` 下生成以下配置文件（`reset` 命令会清理它们）
 | `/etc/modprobe.d/ftool-nvidia-modeset.conf` | NVIDIA DRM modeset 配置 |
 | `/etc/udev/rules.d/50-remove-nvidia.rules` | Integrated 模式 udev 规则 |
 | `/etc/udev/rules.d/80-nvidia-pm.rules` | NVIDIA 运行时电源管理 udev 规则 |
-| `/etc/X11/xorg.conf` / `xorg.conf.d/*.conf` | Xorg 显示配置 |
 | `/etc/prime-discrete` | PRIME 离散模式标志 |
 | `/var/cache/ftool/gpu-cache.json` | GPU 检测缓存 |
 
@@ -243,7 +237,6 @@ ftool 在 `/etc/` 下生成以下配置文件（`reset` 命令会清理它们）
 
 - 支持 `nvidia`（开源内核模块）和 `nvidia-current`（新版驱动模块）
 - 兼容 Fedora Silverblue 等 OSTree 系统的 initramfs 重建
-- 自动识别 GDM、SDDM、LightDM 显示管理器并做相应配置
 - 支持 S0ix（s2idle）和 S3（deep）两种挂起模式的电源管理
 
 ## 许可证

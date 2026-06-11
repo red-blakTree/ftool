@@ -13,6 +13,8 @@ use log::{info, warn};
 /// GPU 工作模式枚举
 ///
 /// 用于控制 NVIDIA Optimus 笔记本的显卡切换策略。
+/// X11 环境下 Nvidia 模式会写入 PrimaryGPU 配置；
+/// Wayland 下由 nvidia-drm modeset 接管显示输出。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuMode {
     /// 仅使用集成显卡，禁用所有 NVIDIA 内核模块
@@ -55,11 +57,7 @@ impl std::str::FromStr for GpuMode {
 /// NVIDIA 模式的专有配置选项
 #[derive(Debug, Clone, Default)]
 pub struct NvidiaOptions {
-    /// 显示管理器类型（Nvidia 模式下用于配置 xrandr provider）
-    pub dm: Option<String>,
-    /// 启用 ForceCompositionPipeline 选项
-    pub force_comp: bool,
-    /// Coolbits 值（如 Some(28)）
+    /// Coolbits 值（如 Some(28)）—— 设置 NVIDIA 内核模块的超频/风扇控制位掩码
     pub coolbits: Option<u32>,
     /// RTD3 电源管理级别（0-3，仅 Hybrid 模式使用）
     pub rtd3: Option<u32>,
@@ -103,12 +101,9 @@ impl GpuController {
             GpuMode::Integrated => Self::switch_integrated()?,
             GpuMode::Compute => Self::switch_compute(nv.use_nvidia_current)?,
             GpuMode::Hybrid => Self::switch_hybrid(nv.rtd3, nv.use_nvidia_current)?,
-            GpuMode::Nvidia => Self::switch_nvidia(
-                nv.dm.clone(),
-                nv.force_comp,
-                nv.coolbits,
-                nv.use_nvidia_current,
-            )?,
+            GpuMode::Nvidia => {
+                Self::switch_nvidia(nv.coolbits, nv.use_nvidia_current)?;
+            }
         }
 
         // 写入 PRIME 离散模式标志（参考 system76-power 的实现）
@@ -145,17 +140,6 @@ impl GpuController {
         cache::GpuCache::delete()?;
         helper::rebuild_initramfs()?;
         info!("✅ 重置成功！请重启计算机以使更改生效。");
-        Ok(())
-    }
-
-    /// 恢复 SDDM 的默认 Xsetup 脚本
-    pub fn reset_sddm() -> Result<(), FtoolError> {
-        create_file(
-            constants::SDDM_XSETUP_PATH,
-            constants::SDDM_XSETUP_CONTENT,
-            true,
-        )?;
-        info!("✅ SDDM Xsetup 已恢复默认。");
         Ok(())
     }
 
@@ -226,8 +210,35 @@ impl GpuController {
     /// 如果 sysfs 中找不到（例如 Integrated 模式下 NVIDIA 已被 udev 移除），
     /// 则回退读取已有缓存数据并重新写入以保持缓存新鲜。
     fn write_nvidia_cache() -> Result<(), FtoolError> {
-        let pci_bus = match detector::GpuDetector::get_nvidia_pci_bus(true) {
-            Ok(bus) => bus,
+        let pci_bus = match detector::GpuDetector::get_nvidia_raw_pci_id() {
+            Ok(raw) => {
+                // 将原始 DDDD:BB:DD.F 格式标准化为 "PCI:BB:DD:F" 写入缓存
+                let without_domain = raw.split_once(':').map(|(_, r)| r).unwrap_or(&raw);
+                let parts: Vec<&str> = without_domain.split(':').collect();
+                if parts.len() != 2 {
+                    return Err(FtoolError::Gpu(format!(
+                        "PCI 设备 ID 格式异常: {}",
+                        raw
+                    )));
+                }
+                let dev_func: Vec<&str> = parts[1].split('.').collect();
+                if dev_func.len() != 2 {
+                    return Err(FtoolError::Gpu(format!(
+                        "PCI 设备 ID 格式异常: {}",
+                        raw
+                    )));
+                }
+                let bus = u32::from_str_radix(parts[0], 16).map_err(|_| {
+                    FtoolError::Gpu(format!("PCI Bus 解析失败: {}", raw))
+                })?;
+                let dev = u32::from_str_radix(dev_func[0], 16).map_err(|_| {
+                    FtoolError::Gpu(format!("PCI Dev 解析失败: {}", raw))
+                })?;
+                let func = u32::from_str_radix(dev_func[1], 16).map_err(|_| {
+                    FtoolError::Gpu(format!("PCI Func 解析失败: {}", raw))
+                })?;
+                format!("PCI:{}:{}:{}", bus, dev, func)
+            }
             Err(_) => {
                 // Fallback: 尝试读取已有缓存
                 let data = cache::GpuCache::read().map_err(|_| {
@@ -342,9 +353,10 @@ impl GpuController {
     }
 
     /// Nvidia 模式：仅使用 NVIDIA 独立显卡输出画面
+    ///
+    /// 写入 X11 PrimaryGPU 配置使 NVIDIA 成为主显示器（参考 system76-power），
+    /// 同时写入 nvidia-drm modeset=1 确保 Wayland 下的 DRM 直通输出。
     fn switch_nvidia(
-        _dm: Option<String>,
-        force_comp: bool,
         coolbits: Option<u32>,
         use_nvidia_current: bool,
     ) -> Result<(), FtoolError> {
@@ -352,23 +364,14 @@ impl GpuController {
             warn!("启用 nvidia-persistenced 失败，继续执行; error={}", e);
         }
 
-        let current_mode = detector::GpuDetector::query_current_mode();
-        let force_detect = current_mode == GpuMode::Hybrid || current_mode == GpuMode::Compute;
-        let (pci_bus, igpu_vendor) = detector::GpuDetector::detect_gpu_info(force_detect)?;
-        info!(
-            "检测到 GPU 信息; pci_bus={}, igpu_vendor={}",
-            pci_bus,
-            igpu_vendor.as_str()
-        );
-
         // 写入空 modprobe 配置
         create_file_bytes(constants::MODPROBE_GPU_PATH, constants::MODPROBE_EMPTY)?;
 
-        Self::write_xorg_config(&igpu_vendor, &pci_bus, force_comp, coolbits)?;
-        Self::write_modeset_config(use_nvidia_current)?;
-        // 独显模式下不需要 xrandr --setprovideroutputsource 配置
-        // (反向 PRIME 会将集显设为渲染源，导致应用使用核显渲染)
-        // NVIDIA 驱动通过 modeset=1 + PrimaryGPU 自动处理 PRIME 同步
+        // 写入 modeset 配置（含可选 Coolbits 参数）
+        Self::write_modeset_config(use_nvidia_current, coolbits)?;
+
+        // 写入 X11 PrimaryGPU 配置（参考 system76-power 的 discrete 模式）
+        helper::write_xorg_nvidia_config()?;
 
         // 启用 nvidia-fallback 服务（参考 system76-power）
         if let Err(e) = helper::toggle_service("nvidia-fallback.service", true) {
@@ -378,53 +381,32 @@ impl GpuController {
         Ok(())
     }
 
-    /// 写入 Xorg 配置文件
+    /// 写入 NVIDIA modeset 内核模块配置
     ///
-    /// 优先使用 OutputClass 方式（现代 Xserver 推荐，参考 system76-power），
-    /// 当需要 ForceCompositionPipeline 或 Coolbits 等额外选项时退回到完整配置。
-    fn write_xorg_config(
-        igpu_vendor: &detector::IgpuVendor,
-        pci_bus: &str,
-        force_comp: bool,
+    /// `use_nvidia_current` 控制使用 nvidia 还是 nvidia-current 模块。
+    /// `coolbits` 作为内核模块参数直接写入 modprobe 配置（Wayland 兼容）。
+    fn write_modeset_config(
+        use_nvidia_current: bool,
         coolbits: Option<u32>,
     ) -> Result<(), FtoolError> {
-        let xorg_conf_dir = std::path::Path::new(constants::XORG_CONF_DIR);
-        let has_extra_opts = force_comp || coolbits.is_some();
-
-        if has_extra_opts || !xorg_conf_dir.exists() {
-            // 需要额外选项，或没有 conf.d 目录时 → 写完整 legacy 配置
-            // 额外选项（ForceCompositionPipeline / Coolbits）直接内联到
-            // nvidia Device 段中，避免拆成两个配置文件的合并冲突。
-            let xorg_content = generator::ConfigGenerator::generate_xorg_legacy(
-                igpu_vendor,
-                pci_bus,
-                force_comp,
-                coolbits,
-            );
-            create_file(constants::XORG_PATH, &xorg_content, false)?;
-
-            // 清理可能遗留的 extra xorg 文件（旧版本写入的）
-            if std::path::Path::new(constants::EXTRA_XORG_PATH).exists() {
-                let _ = std::fs::remove_file(constants::EXTRA_XORG_PATH);
-            }
+        let mut content = if use_nvidia_current {
+            constants::MODESET_CURRENT_CONTENT.to_string()
         } else {
-            // 使用 OutputClass 方式（更简洁，参考 system76-power）
-            let nvidia_primary = generator::ConfigGenerator::generate_xorg_nvidia_primary();
-            create_file_bytes(constants::XORG_NVIDIA_DISCRETE_CONF, nvidia_primary)?;
+            constants::MODESET_CONTENT.to_string()
+        };
+
+        if let Some(val) = coolbits {
+            if use_nvidia_current {
+                content.push_str(&format!(
+                    "options nvidia-current NVreg_Coolbits={}\n",
+                    val
+                ));
+            } else {
+                content.push_str(&format!("options nvidia NVreg_Coolbits={}\n", val));
+            }
         }
 
-        Ok(())
+        create_file(constants::MODESET_PATH, &content, false)
     }
-
-    /// 写入 NVIDIA modeset 内核模块配置
-    fn write_modeset_config(use_nvidia_current: bool) -> Result<(), FtoolError> {
-        let modeset_content = if use_nvidia_current {
-            constants::MODESET_CURRENT_CONTENT
-        } else {
-            constants::MODESET_CONTENT
-        };
-        create_file(constants::MODESET_PATH, modeset_content, false)
-    }
-
 
 }
