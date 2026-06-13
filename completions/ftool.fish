@@ -82,7 +82,7 @@ end
 # ---- -H <算法> <文件> ----
 # 先补全算法
 complete -c ftool -n "__fish_seen_subcommand_from -H; and not __fish_seen_subcommand_from md5 sha1 sha256 sha512" \
-    -xa "md5\tsha1\tsha256\tsha512"
+    -xa "md5 sha1 sha256 sha512"
 
 # 算法确定后补全文件路径或 --string/-s 标志
 for __hash_algo in md5 sha1 sha256 sha512
