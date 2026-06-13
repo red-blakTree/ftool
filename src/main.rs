@@ -14,7 +14,8 @@ fn print_usage() {
   ftool -S <内核路径>            签名指定内核文件 (需要 root)
   ftool -U                       系统版本升级 (需要 root)
   ftool -g <操作> [选项]         显卡模式切换与管理 (需要 root)
-  ftool -H <算法> <文件>         计算文件哈希值 (算法: md5, sha1, sha256, sha512)
+  ftool -H <算法> <文件>         计算文件哈希值
+  ftool -H <算法> -s <字符串>   计算字符串哈希值 (算法: md5, sha1, sha256, sha512)
   ftool -h                       显示帮助
   ftool -V                       显示版本信息
 
@@ -97,10 +98,28 @@ fn handle_upgrade_command() -> Result<(), FtoolError> {
 }
 
 fn handle_hash_command(args: &[OsString]) -> Result<(), FtoolError> {
+    let algo = args[2].to_string_lossy();
+
+    if args.len() >= 4
+        && let Some(flag) = args[3].to_str()
+        && (flag == "--string" || flag == "-s")
+    {
+        // 字符串哈希模式
+        if args.len() < 5 {
+            return Err(FtoolError::Input(
+                "-H --string 参数需要指定要哈希的字符串".into(),
+            ));
+        }
+        let data = args[4].to_string_lossy();
+        let hash = features::hasher::Hasher::compute_string(&algo, &data)?;
+        println!("{} \"{}\"", hash, data);
+        return Ok(());
+    }
+
+    // 文件哈希模式（现有行为）
     if args.len() < 4 {
         return Err(FtoolError::Input("-H 参数需要指定算法和文件路径".into()));
     }
-    let algo = args[2].to_string_lossy();
     let path = &args[3];
     let hash = features::hasher::Hasher::compute(&algo, path)?;
     println!("{} {}", hash, path.to_string_lossy());

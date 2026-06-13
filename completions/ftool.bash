@@ -48,8 +48,12 @@ _ftool() {
         esac
 
         if [[ -n $has_H && -n $has_hash_algo ]]; then
-            # -H 算法之后补全文件路径
-            _filedir
+            # -H 算法之后补全文件路径或 --string/-s 标志
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "--string -s" -- "$cur"))
+            else
+                _filedir
+            fi
             return
         fi
 

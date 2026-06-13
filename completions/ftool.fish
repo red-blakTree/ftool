@@ -84,9 +84,16 @@ end
 complete -c ftool -n "__fish_seen_subcommand_from -H; and not __fish_seen_subcommand_from md5 sha1 sha256 sha512" \
     -xa "md5\tsha1\tsha256\tsha512"
 
-# 算法确定后补全文件路径
+# 算法确定后补全文件路径或 --string/-s 标志
 for __hash_algo in md5 sha1 sha256 sha512
-    complete -c ftool -n "__fish_seen_subcommand_from -H; and __fish_seen_subcommand_from $__hash_algo" \
+    # --string/-s 标志
+    complete -c ftool -n "__fish_seen_subcommand_from -H; and __fish_seen_subcommand_from $__hash_algo; and not __fish_seen_subcommand_from --string -s" \
+        -l string -s s -d "计算字符串哈希值"
+    # --string 之后的字符串参数
+    complete -c ftool -n "__fish_seen_subcommand_from -H; and __fish_seen_subcommand_from $__hash_algo; and __fish_seen_subcommand_from --string -s" \
+        -r -d "要哈希的字符串"
+    # 文件路径（默认）
+    complete -c ftool -n "__fish_seen_subcommand_from -H; and __fish_seen_subcommand_from $__hash_algo; and not __fish_seen_subcommand_from --string -s" \
         -r -F -d "要计算哈希的文件"
 end
 

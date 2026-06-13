@@ -2,7 +2,7 @@ use crate::core::FtoolError;
 use digest::Digest;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Cursor, Read};
 
 /// 文件哈希值计算器
 pub struct Hasher;
@@ -23,11 +23,29 @@ impl Hasher {
         const BUF_SIZE: usize = 1024 * 1024; // 1MiB 缓冲区
         let mut reader = BufReader::with_capacity(BUF_SIZE, file);
 
+        Self::dispatch(algo, &mut reader)
+    }
+
+    /// 计算字符串的哈希值
+    ///
+    /// # 参数
+    /// * `algo` - 哈希算法名称，支持: md5, sha1, sha256, sha512
+    /// * `data` - 要计算哈希的字符串
+    ///
+    /// # 返回
+    /// 小写十六进制字符串表示的哈希值
+    pub fn compute_string(algo: &str, data: &str) -> Result<String, FtoolError> {
+        let mut cursor = Cursor::new(data.as_bytes());
+        Self::dispatch(algo, &mut cursor)
+    }
+
+    /// 根据算法名称分发到对应的哈希实现
+    fn dispatch<D: Read>(algo: &str, reader: &mut D) -> Result<String, FtoolError> {
         match algo {
-            a if a.eq_ignore_ascii_case("md5") => Self::hash::<md5::Md5>(&mut reader),
-            a if a.eq_ignore_ascii_case("sha1") => Self::hash::<sha1::Sha1>(&mut reader),
-            a if a.eq_ignore_ascii_case("sha256") => Self::hash::<sha2::Sha256>(&mut reader),
-            a if a.eq_ignore_ascii_case("sha512") => Self::hash::<sha2::Sha512>(&mut reader),
+            a if a.eq_ignore_ascii_case("md5") => Self::hash::<md5::Md5>(reader),
+            a if a.eq_ignore_ascii_case("sha1") => Self::hash::<sha1::Sha1>(reader),
+            a if a.eq_ignore_ascii_case("sha256") => Self::hash::<sha2::Sha256>(reader),
+            a if a.eq_ignore_ascii_case("sha512") => Self::hash::<sha2::Sha512>(reader),
             _ => Err(FtoolError::Input(format!(
                 "不支持的哈希算法: {algo}，支持: md5, sha1, sha256, sha512"
             ))),
