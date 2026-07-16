@@ -339,57 +339,59 @@ fn has_compute_modprobe_config() -> bool {
 }
 
 /// 综合分类当前 GPU 模式（纯决策函数，不涉及 I/O，便于测试）
+///
+/// 决策优先级（按顺序）：
+/// 1. NVIDIA 模块未加载 → Integrated
+/// 2. prime-discrete 显式标记 "on" → Nvidia
+/// 3. prime-discrete="on-demand" 或有 modeset 配置 → Hybrid/Compute
+/// 4. NVIDIA 已加载但无特征配置 → Nvidia（保守兜底）
 fn classify_mode(
     nvidia_loaded: bool,
-    nouveau_loaded: bool,
+    _nouveau_loaded: bool,
     nvidia_drm_loaded: bool,
     prime_mode: &str,
     is_integrated: bool,
     is_compute: bool,
     has_modeset: bool,
 ) -> super::GpuMode {
-    // 无 NVIDIA 或 nouveau 模块 → Integrated
-    if !nvidia_loaded && !nouveau_loaded {
+    // NVIDIA 模块未加载 → Integrated
+    // （无论 nouveau 是否加载、是否存在 Integrated 配置残留）
+    if !nvidia_loaded {
         return super::GpuMode::Integrated;
     }
 
-    // Integrated 配置存在且 NVIDIA 未加载 → Integrated
-    if is_integrated && !nvidia_loaded {
-        return super::GpuMode::Integrated;
-    }
+    // 以下所有分支 nvidia_loaded 均为 true
 
-    // 配置与运行时不一致告警
-    if is_integrated && nvidia_loaded {
+    // 配置/运行时不一致告警
+    if is_integrated {
         warn!(
             "配置/运行时不匹配: 存在 Integrated 模式的 modprobe 黑名单配置 \
              但 nvidia 内核模块已加载（可能由其他软件或手动操作加载）"
         );
     }
 
-    // prime-discrete = "on" → Nvidia（需要 NVIDIA 模块实际已加载，避免残留文件误判）
+    // prime-discrete 显式标记 "on" → Nvidia 模式
     if prime_mode == "on" {
-        if nvidia_loaded {
-            return super::GpuMode::Nvidia;
-        }
-        debug!("prime-discrete=on 但 NVIDIA 模块未加载，视为残留配置");
-    }
-
-    // prime_mode = "on-demand" 或有 modeset 配置 + NVIDIA 已加载
-    // → 根据 nvidia-drm 加载状态和 modprobe 配置区分 Compute/Hybrid
-    if prime_mode == "on-demand" || (has_modeset && nvidia_loaded) {
-        if (!nvidia_drm_loaded && prime_mode == "off") || is_compute {
-            return super::GpuMode::Compute;
-        }
-        return super::GpuMode::Hybrid;
-    }
-
-    // NVIDIA 已加载但无特征配置 → 默认 Nvidia
-    if nvidia_loaded {
         return super::GpuMode::Nvidia;
     }
 
-    // 默认 Integrated
-    super::GpuMode::Integrated
+    // prime-discrete="on-demand" 或有 modeset 配置 → 在 Hybrid/Compute 间区分
+    if prime_mode == "on-demand" || has_modeset {
+        // Compute 模式判定依据（二选一满足即可）：
+        // (a) 存在 Compute 特征 modprobe 配置（黑名单 drm 但不黑名单核心模块）
+        // (b) 用户显式设置 prime-discrete="off" 且 nvidia-drm 未加载
+        let looks_like_compute = is_compute
+            || (prime_mode == "off" && !nvidia_drm_loaded);
+
+        return if looks_like_compute {
+            super::GpuMode::Compute
+        } else {
+            super::GpuMode::Hybrid
+        };
+    }
+
+    // NVIDIA 已加载但无特征配置 → Nvidia（保守兜底）
+    super::GpuMode::Nvidia
 }
 
     /// 获取 NVIDIA GPU 的原始 PCI 设备 ID（如 "0000:01:00.0"），用于运行时电源控制
