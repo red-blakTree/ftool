@@ -104,6 +104,16 @@ impl GpuDetector {
     ///
     /// 读取失败时仅记录 debug 日志并跳过该设备，避免因单个 sysfs 属性缺失而中断检测。
     fn detect_all_gpus() -> Result<GpuInfoResult, FtoolError> {
+        // PCI bus rescan：重新枚举设备，确保 integrated 模式（udev 已移除）下也能发现 NVIDIA
+        let rescan_path = "/sys/bus/pci/rescan";
+        if Path::new(rescan_path).exists() {
+            if let Err(e) = fs::write(rescan_path, "1") {
+                debug!("PCI rescan 失败（非致命）: {}", e);
+            } else {
+                debug!("PCI bus rescan 完成");
+            }
+        }
+
         let pci_path = Path::new("/sys/bus/pci/devices");
         if !pci_path.is_dir() {
             return Err(FtoolError::Gpu(
@@ -562,6 +572,35 @@ fn classify_mode(
         } else {
             Ok(super::GpuMode::Integrated)
         }
+    }
+    /// 获取所有 NVIDIA PCI 设备的 (vendor, device) 对（所有功能号，不限于显示控制器）
+    /// 用于在 GPU 仍然在线时保存设备 ID 到缓存，供 PCIe 断电后恢复使用
+    pub fn get_all_nvidia_device_ids() -> Result<Vec<crate::features::gpu::cache::NvidiaDeviceId>, FtoolError> {
+        let pci_path = Path::new("/sys/bus/pci/devices");
+        if !pci_path.is_dir() {
+            return Err(FtoolError::Gpu(
+                "/sys/bus/pci/devices 不存在".into(),
+            ));
+        }
+        let entries = fs::read_dir(pci_path)
+            .map_err(|e| FtoolError::Gpu(format!("读取 PCI 目录失败: {}", e)))?;
+
+        let mut ids = Vec::new();
+        for entry in entries.flatten() {
+            let vendor_str = fs::read_to_string(entry.path().join("vendor")).unwrap_or_default();
+            let vendor = u16::from_str_radix(vendor_str.trim_start_matches("0x"), 16).unwrap_or(0);
+            if vendor != 0x10DE {
+                continue;
+            }
+            let device_str = fs::read_to_string(entry.path().join("device")).unwrap_or_default();
+            let device = u16::from_str_radix(device_str.trim_start_matches("0x"), 16).unwrap_or(0);
+            ids.push(crate::features::gpu::cache::NvidiaDeviceId { vendor, device });
+        }
+
+        if ids.is_empty() {
+            return Err(FtoolError::Gpu("未找到任何 NVIDIA PCI 设备".into()));
+        }
+        Ok(ids)
     }
 }
 

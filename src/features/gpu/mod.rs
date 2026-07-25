@@ -28,7 +28,6 @@ pub enum GpuMode {
 }
 
 impl GpuMode {
-    /// 返回模式的字符串表示
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Integrated => "integrated",
@@ -53,13 +52,12 @@ impl std::str::FromStr for GpuMode {
 }
 
 
-
 /// NVIDIA 模式的专有配置选项
 #[derive(Debug, Clone, Default)]
 pub struct NvidiaOptions {
-    /// Coolbits 值（如 Some(28)）—— 设置 NVIDIA 内核模块的超频/风扇控制位掩码
+    /// Nvidia 模式的 Coolbits 位掩码（None = 不启用）
     pub coolbits: Option<u32>,
-    /// RTD3 电源管理级别（0-3，仅 Hybrid 模式使用）
+    /// RTD3 运行时电源管理级别（None = 不启用）
     pub rtd3: Option<u32>,
     /// 使用 nvidia-current 内核模块替代默认的 nvidia
     pub use_nvidia_current: bool,
@@ -108,9 +106,9 @@ impl GpuController {
 
         // 写入 PRIME 离散模式标志（参考 system76-power 的实现）
         let prime_mode = match opts.mode {
-            GpuMode::Hybrid => "on-demand\n",
-            GpuMode::Nvidia => "on\n",
-            GpuMode::Compute | GpuMode::Integrated => "off\n",
+            GpuMode::Hybrid => "on-demand",
+            GpuMode::Nvidia => "on",
+            GpuMode::Compute | GpuMode::Integrated => "off",
         };
         helper::set_prime_discrete(prime_mode)?;
 
@@ -204,13 +202,14 @@ impl GpuController {
 
     // ========== 内部模式切换策略 ==========
 
-    /// 写入 NVIDIA GPU PCI 地址缓存
+    /// 写入 NVIDIA GPU PCI 地址缓存和设备 ID
     ///
     /// 优先通过 sysfs 检测当前 NVIDIA GPU 的 PCI 地址并写入缓存。
+    /// GPU 在线时同时收集所有 NVIDIA 设备 ID（用于 PCIe 断电后恢复）。
     /// 如果 sysfs 中找不到（例如 Integrated 模式下 NVIDIA 已被 udev 移除），
     /// 则回退读取已有缓存数据并重新写入以保持缓存新鲜。
     fn write_nvidia_cache() -> Result<(), FtoolError> {
-        let pci_bus = match detector::GpuDetector::get_nvidia_raw_pci_id() {
+        let (pci_bus, device_ids) = match detector::GpuDetector::get_nvidia_raw_pci_id() {
             Ok(raw) => {
                 // 将原始 DDDD:BB:DD.F 格式标准化为 "PCI:BB:DD:F" 写入缓存
                 let without_domain = raw.split_once(':').map(|(_, r)| r).unwrap_or(&raw);
@@ -237,7 +236,13 @@ impl GpuController {
                 let func = u32::from_str_radix(dev_func[1], 16).map_err(|_| {
                     FtoolError::Gpu(format!("PCI Func 解析失败: {}", raw))
                 })?;
-                format!("PCI:{}:{}:{}", bus, dev, func)
+                let bus_str = format!("PCI:{}:{}:{}", bus, dev, func);
+
+                // GPU 在线时同时收集所有 NVIDIA 设备 ID（用于 PCIe 断电后恢复）
+                let ids: Vec<cache::NvidiaDeviceId> =
+                    detector::GpuDetector::get_all_nvidia_device_ids()
+                        .unwrap_or_default();
+                (bus_str, ids)
             }
             Err(_) => {
                 // Fallback: 尝试读取已有缓存
@@ -247,13 +252,36 @@ impl GpuController {
                     )
                 })?;
                 info!(
-                    "sysfs 未检测到 NVIDIA，使用现有缓存中的 PCI 地址; bus={}",
+                    "sysfs 未检测到 NVIDIA，使用现有缓存中的 PCI 地址和设备 ID; bus={}",
                     data.nvidia_gpu_pci_bus
                 );
-                data.nvidia_gpu_pci_bus
+                (data.nvidia_gpu_pci_bus, data.nvidia_device_ids)
             }
         };
-        cache::GpuCache::write(&CacheData::new(pci_bus))
+        cache::GpuCache::write(&CacheData::new(pci_bus, device_ids))
+    }
+
+    /// 统一配置 NVIDIA GPU 相关 systemd 服务，消除 switch_* 中的重复代码
+    ///
+    /// 各模式对服务的需求：
+    /// - Integrated:  全部禁用（persistenced=false, fallback=false, suspend=false）
+    /// - Compute:     仅 persistenced（persistenced=true,  fallback=false, suspend=false）
+    /// - Hybrid:      persistenced + suspend（persistenced=true,  fallback=false, suspend=true）
+    /// - Nvidia:      全部启用（persistenced=true,  fallback=true,  suspend=true）
+    fn configure_gpu_services(persistenced: bool, fallback: bool, suspend: bool) {
+        let mut errors: Vec<String> = Vec::new();
+        if let Err(e) = helper::toggle_service("nvidia-persistenced.service", persistenced) {
+            errors.push(format!("nvidia-persistenced: {}", e));
+        }
+        if let Err(e) = helper::toggle_service("nvidia-fallback.service", fallback) {
+            errors.push(format!("nvidia-fallback: {}", e));
+        }
+        if let Err(e) = helper::configure_nvidia_suspend_services(suspend) {
+            errors.push(format!("suspend services: {}", e));
+        }
+        if !errors.is_empty() {
+            warn!("GPU 服务配置失败: {}", errors.join("; "));
+        }
     }
 
     /// Integrated 模式：完全禁用 NVIDIA 驱动，仅使用集成显卡
@@ -264,17 +292,7 @@ impl GpuController {
             warn!("保存 NVIDIA GPU 缓存失败，继续执行; error={}", e);
         }
 
-        if let Err(e) = helper::toggle_service("nvidia-persistenced.service", false) {
-            warn!("禁用 nvidia-persistenced 失败，继续执行; error={}", e);
-        }
-
-        // 禁用 NVIDIA 挂起服务和 fallback（Integrated 模式下不需要）
-        if let Err(e) = helper::configure_nvidia_suspend_services(false) {
-            warn!("禁用 NVIDIA 挂起服务失败，继续执行; error={}", e);
-        }
-        if let Err(e) = helper::toggle_service("nvidia-fallback.service", false) {
-            warn!("禁用 nvidia-fallback 失败，继续执行; error={}", e);
-        }
+        Self::configure_gpu_services(false, false, false);
 
         // 写入 modprobe 黑名单（使用二进制写入避免编码问题）
         create_file_bytes(constants::MODPROBE_GPU_PATH, constants::MODPROBE_INTEGRATED)?;
@@ -297,14 +315,7 @@ impl GpuController {
 
     /// Compute 模式：集显输出画面，NVIDIA 可用于 CUDA 计算（参考 system76-power）
     fn switch_compute(use_nvidia_current: bool) -> Result<(), FtoolError> {
-        if let Err(e) = helper::toggle_service("nvidia-persistenced.service", true) {
-            warn!("启用 nvidia-persistenced 失败，继续执行; error={}", e);
-        }
-
-        // 禁用 nvidia-fallback（Compute 模式下集显为主，不需要 fallback）
-        if let Err(e) = helper::toggle_service("nvidia-fallback.service", false) {
-            warn!("禁用 nvidia-fallback 失败，继续执行; error={}", e);
-        }
+        Self::configure_gpu_services(true, false, false);
 
         // 写入 modprobe：仅黑名单显示相关模块，保留 nvidia 核心驱动供计算使用
         create_file_bytes(constants::MODPROBE_GPU_PATH, constants::MODPROBE_COMPUTE)?;
@@ -329,14 +340,7 @@ impl GpuController {
 
     /// Hybrid 模式：PRIME 按需渲染，支持 RTD3 动态电源管理
     fn switch_hybrid(rtd3: Option<u32>, use_nvidia_current: bool) -> Result<(), FtoolError> {
-        if let Err(e) = helper::toggle_service("nvidia-persistenced.service", true) {
-            warn!("启用 nvidia-persistenced 失败，继续执行; error={}", e);
-        }
-
-        // 禁用 nvidia-fallback（Hybrid 模式下集显为主，不需要 fallback）
-        if let Err(e) = helper::toggle_service("nvidia-fallback.service", false) {
-            warn!("禁用 nvidia-fallback 失败，继续执行; error={}", e);
-        }
+        Self::configure_gpu_services(true, false, true);
 
         // 写入空 modprobe 配置（允许所有驱动正常加载）
         create_file_bytes(constants::MODPROBE_GPU_PATH, constants::MODPROBE_EMPTY)?;
@@ -360,9 +364,7 @@ impl GpuController {
         coolbits: Option<u32>,
         use_nvidia_current: bool,
     ) -> Result<(), FtoolError> {
-        if let Err(e) = helper::toggle_service("nvidia-persistenced.service", true) {
-            warn!("启用 nvidia-persistenced 失败，继续执行; error={}", e);
-        }
+        Self::configure_gpu_services(true, true, true);
 
         // 写入空 modprobe 配置
         create_file_bytes(constants::MODPROBE_GPU_PATH, constants::MODPROBE_EMPTY)?;
@@ -375,11 +377,6 @@ impl GpuController {
 
         // 写入 NVIDIA 环境变量配置，确保应用使用 NVIDIA 渲染
         helper::write_nvidia_env_config()?;
-
-        // 启用 nvidia-fallback 服务（参考 system76-power）
-        if let Err(e) = helper::toggle_service("nvidia-fallback.service", true) {
-            warn!("启用 nvidia-fallback 失败，继续执行; error={}", e);
-        }
 
         Ok(())
     }

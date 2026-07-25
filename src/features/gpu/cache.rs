@@ -6,7 +6,14 @@ use std::fs;
 use std::path::Path;
 
 /// 当前缓存格式版本，变更不兼容格式时递增此值
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
+
+/// NVIDIA 设备 ID（vendor + device），用于 GPU PCIe 断电后恢复设备信息
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NvidiaDeviceId {
+    pub vendor: u16,
+    pub device: u16,
+}
 
 /// 缓存数据结构体
 #[derive(Serialize, Deserialize, Debug)]
@@ -15,14 +22,18 @@ pub struct CacheData {
     version: u32,
     /// NVIDIA GPU 的 PCI 总线地址
     pub nvidia_gpu_pci_bus: String,
+    /// 所有 NVIDIA PCI 设备的 (vendor, device) 对，用于 GPU PCIe 断电后恢复设备信息
+    #[serde(default)]
+    pub nvidia_device_ids: Vec<NvidiaDeviceId>,
 }
 
 impl CacheData {
     /// 创建新的缓存数据
-    pub fn new(nvidia_gpu_pci_bus: String) -> Self {
+    pub fn new(nvidia_gpu_pci_bus: String, device_ids: Vec<NvidiaDeviceId>) -> Self {
         Self {
             version: CACHE_VERSION,
             nvidia_gpu_pci_bus,
+            nvidia_device_ids: device_ids,
         }
     }
 }

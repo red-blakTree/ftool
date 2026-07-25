@@ -36,9 +36,11 @@ fn write_file_atomic(path: &str, content: &[u8], executable: bool) -> Result<(),
             .map_err(|e| FtoolError::Gpu(format!("设置权限失败 {}: {}", tmp_path, e)))?;
         debug!("已赋予执行权限; path={}", tmp_path);
     }
-
     fs::rename(&tmp_path, path)
-        .map_err(|e| FtoolError::Gpu(format!("重命名文件到 {} 失败: {}", path, e)))?;
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            FtoolError::Gpu(format!("重命名文件到 {} 失败: {}", path, e))
+        })?;
     debug!("配置文件已生效; path={}", path);
     Ok(())
 }
@@ -203,11 +205,10 @@ pub fn configure_nvidia_suspend_services(enable: bool) -> Result<(), FtoolError>
     }
     Ok(())
 }
-
 /// 写入 PRIME 离散模式标志文件
 pub fn set_prime_discrete(mode: &str) -> Result<(), FtoolError> {
-    info!("设置 {} 为 {}", PRIME_DISCRETE_PATH, mode.trim());
-    create_file(PRIME_DISCRETE_PATH, mode, false)
+    info!("设置 {} 为 {}", PRIME_DISCRETE_PATH, mode);
+    create_file(PRIME_DISCRETE_PATH, &format!("{}\n", mode), false)
 }
 
 /// 根据系统挂起模式，追加对应的 NVIDIA 电源管理配置
