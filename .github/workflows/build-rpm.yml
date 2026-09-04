@@ -1,0 +1,34 @@
+name: Build RPM
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build-rpm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build RPM in Fedora container
+        run: |
+          docker run --rm \
+            -v "$PWD":/work \
+            -w /work \
+            fedora:latest \
+            bash /work/packaging/build-rpm.sh
+
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ftool-rpm
+          path: dist/rpmbuild/RPMS/**/*.rpm
+          if-no-files-found: error
