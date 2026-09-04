@@ -15,6 +15,8 @@ pub enum SleepMode {
     S0ix,
     /// 传统 S3 (deep) 挂起
     S3,
+    /// 无法检测（mem_sleep 文件不存在或格式异常）
+    Unknown,
 }
 
 /// GPU 设备信息（通过 sysfs 检测）
@@ -59,6 +61,12 @@ struct SupportedGpus {
     chips: Vec<NvidiaDevice>,
 }
 
+/// 不可切换的 DMI chassis type（台式机/服务器等固定设备）
+/// 参考 Desktop Management Interface (DMI) Specification：
+/// 3=Desktop, 4=Low Profile Desktop, 5=Pizza Box, 6=Mini Tower,
+/// 7=Tower, 17=Main Server Chassis, 23=Blade Server
+const NON_SWITCHABLE_CHASSIS_TYPES: &[u32] = &[3, 4, 5, 6, 7, 17, 23];
+
 /// 需要外接显示器由 NVIDIA GPU 驱动的产品型号（参考 system76-power）
 const EXTERNAL_DISPLAY_REQUIRES_NVIDIA: &[&str] = &[
     "addw1",
@@ -100,20 +108,24 @@ const DEFAULT_DISCRETE_MODELS: &[&str] = &["bonw16"];
 pub struct GpuDetector;
 
 impl GpuDetector {
+    /// 显式触发一次 PCI bus rescan
+    ///
+    /// 仅在模式切换等确实需要重新枚举被移除设备的路径中调用，
+    /// 普通查询/检测不得调用，避免产生热插拔等系统副作用。
+    pub fn rescan_pci_bus() -> Result<(), FtoolError> {
+        let rescan_path = Path::new("/sys/bus/pci/rescan");
+        if !rescan_path.exists() {
+            return Ok(());
+        }
+        fs::write(rescan_path, "1").map_err(|e| {
+            FtoolError::Gpu(format!("PCI rescan 失败: {}", e))
+        })
+    }
+
     /// 通过 sysfs 检测所有 GPU 设备，返回 (nvidia_gpus, amd_gpus, intel_gpus)
     ///
     /// 读取失败时仅记录 debug 日志并跳过该设备，避免因单个 sysfs 属性缺失而中断检测。
     fn detect_all_gpus() -> Result<GpuInfoResult, FtoolError> {
-        // PCI bus rescan：重新枚举设备，确保 integrated 模式（udev 已移除）下也能发现 NVIDIA
-        let rescan_path = "/sys/bus/pci/rescan";
-        if Path::new(rescan_path).exists() {
-            if let Err(e) = fs::write(rescan_path, "1") {
-                debug!("PCI rescan 失败（非致命）: {}", e);
-            } else {
-                debug!("PCI bus rescan 完成");
-            }
-        }
-
         let pci_path = Path::new("/sys/bus/pci/devices");
         if !pci_path.is_dir() {
             return Err(FtoolError::Gpu(
@@ -229,8 +241,9 @@ impl GpuDetector {
                 String::new()
             }
         };
-        if chassis.trim() == "3" {
-            debug!("检测到台式机，不支持 GPU 切换");
+        let chassis_type: u32 = chassis.trim().parse().unwrap_or(0);
+        if chassis_type != 0 && NON_SWITCHABLE_CHASSIS_TYPES.contains(&chassis_type) {
+            debug!("检测到非笔记本机型 (chassis_type={})，不支持 GPU 切换", chassis_type);
             return Ok(false);
         }
 
@@ -426,11 +439,26 @@ fn classify_mode(
         let mem_sleep = fs::read_to_string("/sys/power/mem_sleep").unwrap_or_default();
         if mem_sleep.contains("[s2idle]") {
             debug!("检测到 S0ix (s2idle) 挂起模式");
-            SleepMode::S0ix
-        } else {
-            debug!("检测到 S3 (deep) 挂起模式");
-            SleepMode::S3
+            return SleepMode::S0ix;
         }
+        if mem_sleep.contains("[deep]") {
+            debug!("检测到 S3 (deep) 挂起模式");
+            return SleepMode::S3;
+        }
+        // mem_sleep 存在但没有方括号默认值（异常情况）
+        if mem_sleep.contains("s2idle") {
+            debug!("检测到 S0ix (s2idle) 挂起模式（无方括号标记）");
+            return SleepMode::S0ix;
+        }
+        if mem_sleep.contains("deep") {
+            debug!("检测到 S3 (deep) 挂起模式（无方括号标记）");
+            return SleepMode::S3;
+        }
+        debug!(
+            "无法从 /sys/power/mem_sleep 检测休眠模式，内容: '{}'",
+            mem_sleep.trim()
+        );
+        SleepMode::Unknown
     }
 
     /// 检测当前 NVIDIA GPU 是否支持运行时电源管理（runtime PM）

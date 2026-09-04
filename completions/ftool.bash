@@ -64,7 +64,7 @@ _ftool() {
                     # 数值参数，不做补全
                     return
                     ;;
-                --use-nvidia-current)
+                --use-nvidia-current|--force-comp)
                     # 布尔 flag，不需要额外参数
                     return
                     ;;
@@ -73,7 +73,7 @@ _ftool() {
                     local subcmd="${words[has_subcmd]}"
                     if [[ "$subcmd" =~ ^(integrated|compute|hybrid|nvidia)$ ]]; then
                         if [[ "$cur" == -* ]]; then
-                            COMPREPLY=($(compgen -W "--coolbits --rtd3 --use-nvidia-current" -- "$cur"))
+                            COMPREPLY=($(compgen -W "--coolbits --rtd3 --use-nvidia-current --force-comp" -- "$cur"))
                             return
                         fi
                     elif [[ "$subcmd" == "power" ]]; then

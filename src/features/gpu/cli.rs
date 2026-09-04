@@ -172,22 +172,35 @@ fn parse_switch_options(
                 nv_opts.use_nvidia_current = true;
                 i += 1;
             }
+            "--force-comp" => {
+                nv_opts.force_comp = true;
+                i += 1;
+            }
             _ => return Err(FtoolError::Input(format!("未知参数: {}", arg))),
         }
     }
 
     info!(
-        "解析显卡切换参数完成; mode={}, coolbits={:?}, rtd3={:?}, use_nvidia_current={}",
+        "解析显卡切换参数完成; mode={}, coolbits={:?}, rtd3={:?}, use_nvidia_current={}, force_comp={}",
         gpu_mode.as_str(),
         nv_opts.coolbits,
         nv_opts.rtd3,
         nv_opts.use_nvidia_current,
+        nv_opts.force_comp,
     );
 
     // 非 nvidia 模式下使用 --coolbits 时发出警告
     if gpu_mode != GpuMode::Nvidia && nv_opts.coolbits.is_some() {
         warn!(
             "--coolbits 仅在 nvidia 模式下生效，当前 {} 模式将忽略该选项",
+            gpu_mode.as_str()
+        );
+    }
+
+    // 非 nvidia 模式下使用 --force-comp 时发出警告
+    if gpu_mode != GpuMode::Nvidia && nv_opts.force_comp {
+        warn!(
+            "--force-comp 仅在 nvidia 模式下生效，当前 {} 模式将忽略该选项",
             gpu_mode.as_str()
         );
     }

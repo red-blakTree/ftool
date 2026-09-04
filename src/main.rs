@@ -38,6 +38,7 @@ fn print_usage() {
 显卡高级选项 (仅在切换模式时使用):
   --rtd3 [0-3]               在 Hybrid 模式下启用 RTD3 电源管理 (默认值: 2)
   --coolbits [值]            在 Nvidia 模式下启用 Coolbits (默认值: 28)
+  --force-comp               在 Nvidia 模式下启用 ForceCompositionPipeline (修复撕裂)
   --use-nvidia-current       使用 nvidia-current 内核模块
 "
     );
@@ -98,6 +99,9 @@ fn handle_upgrade_command() -> Result<(), FtoolError> {
 }
 
 fn handle_hash_command(args: &[OsString]) -> Result<(), FtoolError> {
+    if args.len() < 3 {
+        return Err(FtoolError::Input("-H 参数需要指定算法".into()));
+    }
     let algo = args[2].to_string_lossy();
 
     if args.len() >= 4

@@ -61,6 +61,8 @@ pub struct NvidiaOptions {
     pub rtd3: Option<u32>,
     /// 使用 nvidia-current 内核模块替代默认的 nvidia
     pub use_nvidia_current: bool,
+    /// Nvidia 模式是否启用 ForceCompositionPipeline（修复画面撕裂）
+    pub force_comp: bool,
 }
 
 /// GPU 模式切换选项（封装了目标模式和 NVIDIA 专有选项）
@@ -91,17 +93,42 @@ impl GpuController {
             ));
         }
 
+        // 切换前保存配置快照，失败时自动回滚
+        let snapshot = helper::ConfigSnapshot::save(constants::SNAPSHOT_PATHS)?;
+
+        let result = Self::do_switch(&opts);
+        if let Err(ref e) = result {
+            warn!("切换失败，正在回滚配置: {}", e);
+            snapshot.restore();
+            // 回滚后也重建 initramfs，恢复之前的内核模块/initramfs 状态
+            if let Err(rebuild_err) = helper::rebuild_initramfs() {
+                warn!("回滚后重建 initramfs 失败: {}", rebuild_err);
+            }
+        }
+        result
+    }
+
+    /// 执行实际的模式切换（内部使用）
+    fn do_switch(opts: &SwitchOptions) -> Result<(), FtoolError> {
         info!("🚀 正在切换到 {} 模式...", opts.mode.as_str());
         helper::cleanup()?;
+
+        // 从 Integrated 模式离开时，NVIDIA PCI 设备可能已被 udev 移除。
+        // 清理掉移除规则后先做一次显式 rescan，便于后续重新检测和写缓存；
+        // rescan 失败不阻断流程，仍可回退到已有缓存。
+        if opts.mode != GpuMode::Integrated
+            && detector::GpuDetector::query_current_mode() == GpuMode::Integrated
+            && let Err(e) = detector::GpuDetector::rescan_pci_bus()
+        {
+            warn!("PCI rescan 失败（非致命）: {}", e);
+        }
 
         let nv = &opts.nvidia_opts;
         match opts.mode {
             GpuMode::Integrated => Self::switch_integrated()?,
             GpuMode::Compute => Self::switch_compute(nv.use_nvidia_current)?,
             GpuMode::Hybrid => Self::switch_hybrid(nv.rtd3, nv.use_nvidia_current)?,
-            GpuMode::Nvidia => {
-                Self::switch_nvidia(nv.coolbits, nv.use_nvidia_current)?;
-            }
+            GpuMode::Nvidia => Self::switch_nvidia(nv)?,
         }
 
         // 写入 PRIME 离散模式标志（参考 system76-power 的实现）
@@ -359,21 +386,25 @@ impl GpuController {
     /// Nvidia 模式：仅使用 NVIDIA 独立显卡输出画面
     ///
     /// 写入 X11 PrimaryGPU 配置使 NVIDIA 成为主显示器（参考 system76-power），
-    /// 同时写入 nvidia-drm modeset=1 确保 Wayland 下的 DRM 直通输出。
-    fn switch_nvidia(
-        coolbits: Option<u32>,
-        use_nvidia_current: bool,
-    ) -> Result<(), FtoolError> {
+    /// 同时写入 nvidia-drm modeset=1 确保 Wayland 下的 DRM 直通输出，
+    /// 并补充 ForceCompositionPipeline/Coolbits 等 Xorg 选项与 DM 桥接脚本。
+    fn switch_nvidia(opts: &NvidiaOptions) -> Result<(), FtoolError> {
         Self::configure_gpu_services(true, true, true);
 
         // 写入空 modprobe 配置
         create_file_bytes(constants::MODPROBE_GPU_PATH, constants::MODPROBE_EMPTY)?;
 
-        // 写入 modeset 配置（含可选 Coolbits 参数）
-        Self::write_modeset_config(use_nvidia_current, coolbits)?;
+        // 写入 modeset 配置（不含 Coolbits；Coolbits 写入 Xorg 额外配置）
+        Self::write_modeset_config(opts.use_nvidia_current)?;
 
         // 写入 X11 PrimaryGPU 配置（参考 system76-power 的 discrete 模式）
         helper::write_xorg_nvidia_config()?;
+
+        // 写入 NVIDIA 额外 Xorg 配置（ForceCompositionPipeline / Coolbits）
+        helper::write_xorg_nvidia_extra_config(opts)?;
+
+        // Display Manager 适配：SDDM / LightDM 的 xrandr 桥接脚本
+        helper::write_dm_scripts()?;
 
         // 写入 NVIDIA 环境变量配置，确保应用使用 NVIDIA 渲染
         helper::write_nvidia_env_config()?;
@@ -384,29 +415,12 @@ impl GpuController {
     /// 写入 NVIDIA modeset 内核模块配置
     ///
     /// `use_nvidia_current` 控制使用 nvidia 还是 nvidia-current 模块。
-    /// `coolbits` 作为内核模块参数直接写入 modprobe 配置（Wayland 兼容）。
-    fn write_modeset_config(
-        use_nvidia_current: bool,
-        coolbits: Option<u32>,
-    ) -> Result<(), FtoolError> {
-        let mut content = if use_nvidia_current {
-            constants::MODESET_CURRENT_CONTENT.to_string()
+    fn write_modeset_config(use_nvidia_current: bool) -> Result<(), FtoolError> {
+        let content = if use_nvidia_current {
+            constants::MODESET_CURRENT_CONTENT
         } else {
-            constants::MODESET_CONTENT.to_string()
+            constants::MODESET_CONTENT
         };
-
-        if let Some(val) = coolbits {
-            if use_nvidia_current {
-                content.push_str(&format!(
-                    "options nvidia-current NVreg_Coolbits={}\n",
-                    val
-                ));
-            } else {
-                content.push_str(&format!("options nvidia NVreg_Coolbits={}\n", val));
-            }
-        }
-
-        create_file(constants::MODESET_PATH, &content, false)
+        create_file(constants::MODESET_PATH, content, false)
     }
-
 }

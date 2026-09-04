@@ -29,6 +29,7 @@ ftool 是一个用 Rust 编写的系统级命令行工具，主要面向 **NVIDI
 
 - `--rtd3 <0-3>` —— 在 Hybrid 模式下启用 RTD3 运行时动态电源管理（默认值：2），级别越高省电效果越好
 - `--coolbits <值>` —— 在 Nvidia 模式下启用 Coolbits 超频/调压选项（默认值：28）
+- `--force-comp` —— 在 Nvidia 模式下启用 ForceCompositionPipeline，修复画面撕裂
 - `--use-nvidia-current` —— 使用 `nvidia-current` 内核模块替代默认的 `nvidia` 模块
 
 示例：

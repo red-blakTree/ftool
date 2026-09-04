@@ -77,6 +77,8 @@ for __gpu_mode in integrated compute hybrid nvidia
         -l rtd3 -r -d "启用 RTD3 电源管理 (0-3, 默认: 2)"
     complete -c ftool -n "__fish_seen_subcommand_from -g; and __fish_seen_subcommand_from $__gpu_mode" \
         -l use-nvidia-current -d "使用 nvidia-current 内核模块"
+    complete -c ftool -n "__fish_seen_subcommand_from -g; and __fish_seen_subcommand_from $__gpu_mode" \
+        -l force-comp -d "启用 ForceCompositionPipeline (修复撕裂)"
 end
 
 # ---- -H <算法> <文件> ----
