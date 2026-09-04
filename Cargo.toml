@@ -8,10 +8,10 @@ homepage = "https://github.com/red-blakTree/ftool"
 
 [package.metadata.generate-rpm]
 assets = [
-    ["target/release/ftool", "usr/bin/ftool", "755"],
-    ["completions/ftool.bash", "usr/share/bash-completion/completions/ftool", "644"],
-    ["completions/ftool.fish", "usr/share/fish/vendor_completions.d/ftool.fish", "644"],
-    ["LICENSE", "usr/share/licenses/ftool/LICENSE", "644"],
+    { source = "target/release/ftool", dest = "/usr/bin/ftool", mode = "755" },
+    { source = "completions/ftool.bash", dest = "/usr/share/bash-completion/completions/ftool", mode = "644" },
+    { source = "completions/ftool.fish", dest = "/usr/share/fish/vendor_completions.d/ftool.fish", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/ftool/LICENSE", mode = "644" },
 ]
 
 [dependencies]
