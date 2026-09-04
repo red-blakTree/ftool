@@ -18,24 +18,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build RPM in Fedora container
-        run: |
-          docker run --rm \
-            -v "$PWD":/work \
-            -w /work \
-            fedora:latest \
-            bash /work/packaging/build-rpm.sh
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm --locked
+
+      - name: Generate RPM
+        run: cargo generate-rpm
 
       - name: Upload RPM artifact
         uses: actions/upload-artifact@v4
         with:
           name: ftool-rpm
-          path: dist/rpmbuild/RPMS/**/*.rpm
+          path: target/generate-rpm/*.rpm
           if-no-files-found: error
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/rpmbuild/RPMS/**/*.rpm
+          files: target/generate-rpm/*.rpm
           generate_release_notes: true

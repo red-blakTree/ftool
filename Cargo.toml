@@ -2,6 +2,17 @@
 name = "ftool"
 version = "0.1.1"
 edition = "2024"
+description = "Fedora system utility for NVIDIA Optimus GPU switching"
+license = "GPL-3.0-or-later"
+homepage = "https://github.com/red-blakTree/ftool"
+
+[package.metadata.generate-rpm]
+assets = [
+    ["target/release/ftool", "usr/bin/ftool", "755"],
+    ["completions/ftool.bash", "usr/share/bash-completion/completions/ftool", "644"],
+    ["completions/ftool.fish", "usr/share/fish/vendor_completions.d/ftool.fish", "644"],
+    ["LICENSE", "usr/share/licenses/ftool/LICENSE", "644"],
+]
 
 [dependencies]
 md-5 = "0.11.0"
