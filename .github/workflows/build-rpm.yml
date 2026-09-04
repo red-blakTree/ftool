@@ -12,7 +12,7 @@ jobs:
   build-rpm:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
 
     steps:
       - name: Checkout
@@ -32,3 +32,10 @@ jobs:
           name: ftool-rpm
           path: dist/rpmbuild/RPMS/**/*.rpm
           if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/rpmbuild/RPMS/**/*.rpm
+          generate_release_notes: true
