@@ -6,7 +6,7 @@ use log::error;
 use std::ffi::OsString;
 use std::io::Write;
 
-const VERSION: &str = "0.1.2";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_usage() {
     println!(

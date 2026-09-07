@@ -8,6 +8,12 @@ on:
       - "v*"
   workflow_dispatch:
 
+# main 分支的滚动 Release 每次 push 都会删除重建，并发 push 会产生竞态
+# （两个 job 同时 delete/create latest），取消旧的在途构建只保留最新
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-rpm:
     runs-on: ubuntu-latest

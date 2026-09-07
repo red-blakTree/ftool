@@ -22,7 +22,15 @@ impl KernelSigner {
         if status.success() {
             return Ok(());
         }
-        println!("📦 未找到 sbsign 命令，正在自动安装 sbsigntools...");
+        // 自动安装会触发联网与系统包变更：仅在交互终端经用户确认后执行，
+        // 非终端场景（脚本/cron）直接给出手动安装指引
+        if !Prompter::is_terminal()
+            || !Prompter::ask_yes("📦 未找到 sbsign 命令，是否自动安装 sbsigntools？ [y/N]: ", false)
+        {
+            return Err(FtoolError::Sign(
+                "未找到 sbsign 命令，请先手动安装: sudo dnf install sbsigntools".into(),
+            ));
+        }
         let install_status = CommandRunner::run_status("dnf", ["install", "-y", "sbsigntools"])?;
         if !install_status.success() {
             return Err(FtoolError::Sign(
@@ -226,10 +234,14 @@ impl KernelSigner {
             )));
         }
 
-        // 恢复原文件权限（新文件由 sbsign 按 umask 创建）
-        if let Err(e) = fs::set_permissions(&real_path, fs::Permissions::from_mode(original_mode))
-        {
-            warn!("恢复内核文件权限失败: {}", e);
+        // 恢复原文件权限（新文件由 sbsign 按 umask 创建，可能丢失 0600 等收紧权限）。
+        // 恢复失败必须报错而非仅告警：引导文件意外放宽权限是安全降级；
+        // 此时备份尚未删除，保留在 bak 供用户手动恢复
+        if let Err(e) = fs::set_permissions(&real_path, fs::Permissions::from_mode(original_mode)) {
+            return Err(FtoolError::Sign(format!(
+                "签名完成但恢复内核文件权限失败: {e}；原文件备份保留在 {}，请手动检查文件权限",
+                bak.display()
+            )));
         }
 
         // 签名成功：清理备份，并同步父目录保证目录项落盘
