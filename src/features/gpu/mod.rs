@@ -19,8 +19,6 @@ use log::{info, warn};
 pub enum GpuMode {
     /// 仅使用集成显卡，禁用所有 NVIDIA 内核模块
     Integrated,
-    /// 集显输出画面，NVIDIA 仅用于 CUDA/计算任务
-    Compute,
     /// PRIME 混合模式，按需动态渲染
     Hybrid,
     /// 仅使用 NVIDIA 独立显卡
@@ -31,7 +29,6 @@ impl GpuMode {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Integrated => "integrated",
-            Self::Compute => "compute",
             Self::Hybrid => "hybrid",
             Self::Nvidia => "nvidia",
         }
@@ -43,7 +40,6 @@ impl std::str::FromStr for GpuMode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "integrated" => Ok(Self::Integrated),
-            "compute" => Ok(Self::Compute),
             "hybrid" => Ok(Self::Hybrid),
             "nvidia" => Ok(Self::Nvidia),
             _ => Err(FtoolError::Input(format!("不支持的模式: {}", s))),
@@ -126,7 +122,6 @@ impl GpuController {
         let nv = &opts.nvidia_opts;
         match opts.mode {
             GpuMode::Integrated => Self::switch_integrated()?,
-            GpuMode::Compute => Self::switch_compute(nv.use_nvidia_current)?,
             GpuMode::Hybrid => Self::switch_hybrid(nv.rtd3, nv.use_nvidia_current)?,
             GpuMode::Nvidia => Self::switch_nvidia(nv)?,
         }
@@ -135,7 +130,7 @@ impl GpuController {
         let prime_mode = match opts.mode {
             GpuMode::Hybrid => "on-demand",
             GpuMode::Nvidia => "on",
-            GpuMode::Compute | GpuMode::Integrated => "off",
+            GpuMode::Integrated => "off",
         };
         helper::set_prime_discrete(prime_mode)?;
 
@@ -162,18 +157,22 @@ impl GpuController {
     pub fn reset() -> Result<(), FtoolError> {
         info!("🔄 正在重置 GPU 配置...");
         helper::cleanup()?;
+        // 禁用 NVIDIA 相关 systemd 服务（与 Integrated 模式策略一致），
+        // 否则清理配置后会残留仍处于 enable 状态的 suspend/persistenced 服务，
+        // 形成"服务启用但挂起参数已被删除"的不一致中间态
+        Self::configure_gpu_services(false, false, false);
         cache::GpuCache::delete()?;
         helper::rebuild_initramfs()?;
         info!("✅ 重置成功！请重启计算机以使更改生效。");
         Ok(())
     }
 
-    /// 创建 NVIDIA GPU 缓存（需处于 hybrid 或 compute 模式）
+    /// 创建 NVIDIA GPU 缓存（需处于 hybrid 模式）
     pub fn cache_create() -> Result<(), FtoolError> {
         let mode = detector::GpuDetector::query_current_mode();
-        if mode != GpuMode::Hybrid && mode != GpuMode::Compute {
+        if mode != GpuMode::Hybrid {
             return Err(FtoolError::Input(
-                "--cache-create 要求系统当前处于 hybrid 或 compute 模式".into(),
+                "--cache-create 要求系统当前处于 hybrid 模式".into(),
             ));
         }
         Self::write_nvidia_cache()
@@ -265,10 +264,21 @@ impl GpuController {
                 })?;
                 let bus_str = format!("PCI:{}:{}:{}", bus, dev, func);
 
-                // GPU 在线时同时收集所有 NVIDIA 设备 ID（用于 PCIe 断电后恢复）
-                let ids: Vec<cache::NvidiaDeviceId> =
-                    detector::GpuDetector::get_all_nvidia_device_ids()
-                        .unwrap_or_default();
+                // GPU 在线时同时收集所有 NVIDIA 设备 ID（用于 PCIe 断电后恢复）。
+                // rescan 后设备枚举是异步的，首次收集失败时短暂重试一次，
+                // 避免竞态下静默把空设备列表写入缓存
+                let mut collected = detector::GpuDetector::get_all_nvidia_device_ids();
+                if collected.is_err() {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    collected = detector::GpuDetector::get_all_nvidia_device_ids();
+                }
+                let ids: Vec<cache::NvidiaDeviceId> = match collected {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        warn!("收集 NVIDIA 设备 ID 失败，缓存将不含设备 ID; error={}", e);
+                        Vec::new()
+                    }
+                };
                 (bus_str, ids)
             }
             Err(_) => {
@@ -292,7 +302,6 @@ impl GpuController {
     ///
     /// 各模式对服务的需求：
     /// - Integrated:  全部禁用（persistenced=false, fallback=false, suspend=false）
-    /// - Compute:     仅 persistenced（persistenced=true,  fallback=false, suspend=false）
     /// - Hybrid:      persistenced + suspend（persistenced=true,  fallback=false, suspend=true）
     /// - Nvidia:      全部启用（persistenced=true,  fallback=true,  suspend=true）
     fn configure_gpu_services(persistenced: bool, fallback: bool, suspend: bool) {
@@ -338,31 +347,6 @@ impl GpuController {
         }
 
         Ok(())
-    }
-
-    /// Compute 模式：集显输出画面，NVIDIA 可用于 CUDA 计算（参考 system76-power）
-    fn switch_compute(use_nvidia_current: bool) -> Result<(), FtoolError> {
-        Self::configure_gpu_services(true, false, false);
-
-        // 写入 modprobe：仅黑名单显示相关模块，保留 nvidia 核心驱动供计算使用
-        create_file_bytes(constants::MODPROBE_GPU_PATH, constants::MODPROBE_COMPUTE)?;
-
-        // 写入 Compute 专用 modeset 配置（不启用 drm modeset，因为 nvidia-drm 已被黑名单）
-        let modeset_content = if use_nvidia_current {
-            constants::MODESET_COMPUTE_CURRENT_CONTENT
-        } else {
-            constants::MODESET_COMPUTE_CONTENT
-        };
-        create_file(constants::MODESET_PATH, modeset_content, false)?;
-
-        // 写入 Compute 专用 udev 电源管理规则（保留 Audio/USB/UCSI 设备）
-        create_file(
-            constants::UDEV_PM_PATH,
-            constants::UDEV_PM_COMPUTE_CONTENT,
-            false,
-        )?;
-
-        Self::write_nvidia_cache()
     }
 
     /// Hybrid 模式：PRIME 按需渲染，支持 RTD3 动态电源管理

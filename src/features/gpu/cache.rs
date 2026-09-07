@@ -1,6 +1,6 @@
 use crate::core::FtoolError;
 use crate::features::gpu::constants::CACHE_FILE_PATH;
-use log::{debug, warn};
+use log::debug;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -103,12 +103,13 @@ impl GpuCache {
 
     /// 删除缓存文件
     pub fn delete() -> Result<(), FtoolError> {
-        if Path::new(CACHE_FILE_PATH).exists() {
-            debug!("删除缓存文件; path={}", CACHE_FILE_PATH);
-            fs::remove_file(CACHE_FILE_PATH)
-                .map_err(|e| FtoolError::Gpu(format!("删除缓存文件失败: {}", e)))?;
+        debug!("删除缓存文件; path={}", CACHE_FILE_PATH);
+        match fs::remove_file(CACHE_FILE_PATH) {
+            Ok(()) => Ok(()),
+            // 文件本就不存在与删除成功等价，无需报错
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(FtoolError::Gpu(format!("删除缓存文件失败: {}", e))),
         }
-        Ok(())
     }
 
     /// 查询并返回格式化后的缓存内容
@@ -116,10 +117,9 @@ impl GpuCache {
         match Self::read() {
             Ok(data) => serde_json::to_string_pretty(&data)
                 .map_err(|e| FtoolError::Gpu(format!("序列化缓存失败: {}", e))),
-            Err(_) => {
-                warn!("无缓存数据或缓存读取失败");
-                Ok("无缓存数据".to_string())
-            }
+            // 缓存从未创建属于正常状态；损坏/版本不符等其他错误应透出以便排障
+            Err(_) if !Path::new(CACHE_FILE_PATH).exists() => Ok("无缓存数据".to_string()),
+            Err(e) => Err(e),
         }
     }
 }

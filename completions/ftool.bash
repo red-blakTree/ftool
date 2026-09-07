@@ -21,7 +21,7 @@ _ftool() {
             -H) has_H=1 ;;
             -h|--help) has_h=1 ;;
             -V|--version) has_V=1 ;;
-            integrated|compute|hybrid|nvidia|query|power|switchable|reset|cache-create|cache-delete|cache-query)
+            integrated|hybrid|nvidia|query|power|switchable|default|ext-display|runtimepm|reset|cache-create|cache-delete|cache-query)
                 has_subcmd="$i" ;;
             md5|sha1|sha256|sha512) has_hash_algo=1 ;;
         esac
@@ -42,7 +42,7 @@ _ftool() {
                 ;;
             -g)
                 # 补全显卡操作
-                COMPREPLY=($(compgen -W "integrated compute hybrid nvidia query power switchable reset cache-create cache-delete cache-query" -- "$cur"))
+                COMPREPLY=($(compgen -W "integrated hybrid nvidia query power switchable default ext-display runtimepm reset cache-create cache-delete cache-query" -- "$cur"))
                 return
                 ;;
         esac
@@ -71,7 +71,7 @@ _ftool() {
                 *)
                     # 检查当前子命令是否需要高级选项补全
                     local subcmd="${words[has_subcmd]}"
-                    if [[ "$subcmd" =~ ^(integrated|compute|hybrid|nvidia)$ ]]; then
+                    if [[ "$subcmd" =~ ^(integrated|hybrid|nvidia)$ ]]; then
                         if [[ "$cur" == -* ]]; then
                             COMPREPLY=($(compgen -W "--coolbits --rtd3 --use-nvidia-current --force-comp" -- "$cur"))
                             return

@@ -4,6 +4,7 @@ mod features;
 use core::error::FtoolError;
 use log::error;
 use std::ffi::OsString;
+use std::io::Write;
 
 const VERSION: &str = "0.1.1";
 
@@ -21,7 +22,6 @@ fn print_usage() {
 
 显卡管理操作:
   integrated   仅使用集成显卡 (省电，屏蔽N卡)
-  compute      集显输出 + N卡计算 (省电+GPU计算)
   hybrid       混合模式 (PRIME，按需渲染)
   nvidia       仅使用 NVIDIA 显卡 (高性能)
   default      根据硬件推荐默认模式
@@ -31,7 +31,7 @@ fn print_usage() {
   ext-display  检测外接显示器是否需要独显
   runtimepm    检测 GPU 是否支持运行时电源管理
   reset        还原 ftool 做出的所有修改
-  cache-create 创建显卡缓存 (在 hybrid/compute 模式下可用)
+  cache-create 创建显卡缓存 (在 hybrid 模式下可用)
   cache-delete 删除显卡缓存
   cache-query  查询显卡缓存内容
 
@@ -55,6 +55,7 @@ fn main() {
     let args: Vec<OsString> = std::env::args_os().collect();
     if args.len() < 2 {
         print_usage();
+        let _ = std::io::stdout().flush(); // exit 不冲刷 stdout，管道场景可能丢失输出
         std::process::exit(1);
     }
 
@@ -89,6 +90,11 @@ fn handle_sign_command(args: &[OsString]) -> Result<(), FtoolError> {
     if args.len() < 3 {
         return Err(FtoolError::Input("-S 参数需要指定内核文件路径".into()));
     }
+    if args.len() > 3 {
+        return Err(FtoolError::Input(
+            "-S 只接受一个内核文件路径参数（多余参数；路径含空格请用引号包裹）".into(),
+        ));
+    }
     core::privilege::Privilege::ensure_root()
         .and_then(|_| features::signer::KernelSigner::sign_kernel(&args[2]))
 }
@@ -111,7 +117,14 @@ fn handle_hash_command(args: &[OsString]) -> Result<(), FtoolError> {
         // 字符串哈希模式
         if args.len() < 5 {
             return Err(FtoolError::Input(
-                "-H --string 参数需要指定要哈希的字符串".into(),
+                "-H --string 参数需要指定要哈希的字符串\n\
+                 （若想哈希一个恰好名为 '-s'/'--string' 的文件，请用 './-s' 形式指定路径）"
+                    .into(),
+            ));
+        }
+        if args.len() > 5 {
+            return Err(FtoolError::Input(
+                "-H --string 多余参数（字符串含空格请用引号包裹）".into(),
             ));
         }
         let data = args[4].to_string_lossy();
@@ -123,6 +136,11 @@ fn handle_hash_command(args: &[OsString]) -> Result<(), FtoolError> {
     // 文件哈希模式（现有行为）
     if args.len() < 4 {
         return Err(FtoolError::Input("-H 参数需要指定算法和文件路径".into()));
+    }
+    if args.len() > 4 {
+        return Err(FtoolError::Input(
+            "-H 多余参数（文件路径含空格请用引号包裹整个路径）".into(),
+        ));
     }
     let path = &args[3];
     let hash = features::hasher::Hasher::compute(&algo, path)?;

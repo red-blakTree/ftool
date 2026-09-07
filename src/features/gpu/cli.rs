@@ -11,7 +11,7 @@ pub fn handle(args: &[OsString]) -> Result<(), FtoolError> {
     if args.len() < 3 {
         return Err(FtoolError::Input(
             "请指定显卡操作或模式\n\
-             用法: ftool -g <integrated|compute|hybrid|nvidia|query|power|switchable|reset|...>"
+             用法: ftool -g <integrated|hybrid|nvidia|query|power|switchable|reset|...>"
                 .into(),
         ));
     }
@@ -25,7 +25,7 @@ pub fn handle(args: &[OsString]) -> Result<(), FtoolError> {
         "default" => handle_default(),
         "ext-display" => handle_ext_display(),
         "runtimepm" => handle_runtimepm(),
-        "integrated" | "compute" | "hybrid" | "nvidia" => {
+        "integrated" | "hybrid" | "nvidia" => {
             Privilege::ensure_root()?;
             let opts = parse_switch_options(&action, &args[3..])?;
             GpuController::switch_mode(opts)
@@ -101,6 +101,12 @@ fn handle_power(args: &[OsString]) -> Result<(), FtoolError> {
             println!("关闭 (独立显卡)");
         }
         return Ok(());
+    }
+
+    if args.len() > 4 {
+        return Err(FtoolError::Input(
+            "power 子命令最多接受一个参数 (on|off|auto)".into(),
+        ));
     }
 
     Privilege::ensure_root()?;
@@ -203,6 +209,19 @@ fn parse_switch_options(
             "--force-comp 仅在 nvidia 模式下生效，当前 {} 模式将忽略该选项",
             gpu_mode.as_str()
         );
+    }
+
+    // --rtd3 仅在 hybrid 模式下生效，其他模式静默忽略会让用户误以为已启用
+    if gpu_mode != GpuMode::Hybrid && nv_opts.rtd3.is_some() {
+        warn!(
+            "--rtd3 仅在 hybrid 模式下生效，当前 {} 模式将忽略该选项",
+            gpu_mode.as_str()
+        );
+    }
+
+    // --use-nvidia-current 在 integrated 模式下无意义（NVIDIA 模块已被黑名单）
+    if gpu_mode == GpuMode::Integrated && nv_opts.use_nvidia_current {
+        warn!("--use-nvidia-current 在 integrated 模式下无效（NVIDIA 模块已被黑名单），将忽略该选项");
     }
 
     Ok(SwitchOptions {

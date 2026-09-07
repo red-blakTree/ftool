@@ -12,12 +12,11 @@ ftool 是一个用 Rust 编写的系统级命令行工具，主要面向 **NVIDI
 
 ### 🎮 显卡模式切换与检测（`-g`）
 
-针对 NVIDIA Optimus 双显卡笔记本，提供四种工作模式：
+针对 NVIDIA Optimus 双显卡笔记本，提供三种工作模式：
 
 | 模式 | 说明 | 功耗 | 适用场景 |
 |------|------|------|----------|
 | `integrated` | 仅使用集成显卡，完全禁用 NVIDIA 驱动 | 最低 | 办公、网页浏览、轻量任务 |
-| `compute` | 集成显卡输出画面，NVIDIA 专供 CUDA 计算 | 较低 | 机器学习训练、视频编码 |
 | `hybrid` | PRIME 按需渲染，根据负载自动切换 | 适中 | 日常综合使用（默认推荐） |
 | `nvidia` | 仅使用 NVIDIA 独立显卡 | 最高 | 游戏、3D 渲染、外接显示器 |
 
@@ -91,7 +90,7 @@ sudo ftool -g reset
 ftool 会将检测到的 NVIDIA GPU PCI 总线地址缓存到 `/var/cache/ftool/gpu-cache.json`，避免在后续切换操作中重复检测。
 
 ```bash
-# 创建显卡缓存（需处于 hybrid 或 compute 模式）
+# 创建显卡缓存（需处于 hybrid 模式）
 sudo ftool -g cache-create
 
 # 查询显卡缓存内容
@@ -215,7 +214,6 @@ ftool/
 ### GPU 模式切换原理
 
 - **Integrated**：通过 `modprobe.d` 黑名单禁用所有 NVIDIA 内核模块，通过 udev 规则在 PCI 设备出现时自动移除 NVIDIA 设备
-- **Compute**：黑名单仅禁用显示相关模块（nvidia-drm、nvidia-modeset），保留 nvidia 核心驱动和 nvidia-uvm 供 CUDA 使用
 - **Hybrid**：允许所有驱动正常加载，配置 modeset=1 和 RTD3 电源管理，通过 udev 规则实现运行时电源管理
 - **Nvidia**：将 NVIDIA 设为主 GPU，通过 modeset=1 配置 nvidia-drm 在 Wayland 下工作
 

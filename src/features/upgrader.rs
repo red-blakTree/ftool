@@ -43,7 +43,14 @@ impl Upgrader {
         let next = cur + 1;
         println!("\n⚠️ 即将进行系统升级: Fedora {cur} → {next}");
 
-        if Prompter::is_terminal() && !Prompter::ask_yes("是否继续？ [y/N]: ", false) {
+        // 升级是不可逆的大动作：非交互终端（管道/脚本/cron）下禁止自动放行，
+        // 必须由人工在终端确认后才继续
+        if !Prompter::is_terminal() {
+            return Err(FtoolError::Upgrade(
+                "stdin 不是交互终端，已中止升级（升级操作必须人工在终端确认）".into(),
+            ));
+        }
+        if !Prompter::ask_yes("是否继续？ [y/N]: ", false) {
             println!("已取消升级。");
             return Ok(());
         }
@@ -72,16 +79,19 @@ impl Upgrader {
             CommandRunner::ensure_success(status)?;
         }
 
-        // 检查 dnf system-upgrade 插件是否可用
-        let plugin_check = CommandRunner::run_status("rpm", ["-q", "dnf-plugin-system-upgrade"])?;
-        if !plugin_check.success() {
-            // DNF5 已将 system-upgrade 内建，无需额外插件
-            let dnf5_check = CommandRunner::run_status("rpm", ["-q", "dnf5"])?;
-            if !dnf5_check.success() {
-                return Err(FtoolError::Upgrade(
-                    "未找到 dnf-plugin-system-upgrade，请先安装:\n  sudo dnf install dnf-plugin-system-upgrade".into(),
-                ));
-            }
+        // 检查 dnf 是否支持 system-upgrade（能力探测：--help 无副作用）
+        // DNF4 需要 dnf-plugin-system-upgrade；DNF5 在 Fedora 42+ 已内建，
+        // 更早版本需要 dnf5-plugin-system-upgrade——插件包名随 dnf 世代而变，
+        // 不能硬编码包名，故直接探测子命令是否可用。
+        if !Self::supports_system_upgrade() {
+            let pkg = if Self::dnf_is_dnf5() {
+                "dnf5-plugin-system-upgrade"
+            } else {
+                "dnf-plugin-system-upgrade"
+            };
+            return Err(FtoolError::Upgrade(format!(
+                "当前 dnf 不支持 system-upgrade，请先安装:\n  sudo dnf install {pkg}"
+            )));
         }
 
         println!("\n[2/3] 下载 Fedora {next} 软件包...");
@@ -107,11 +117,52 @@ impl Upgrader {
         if Prompter::is_terminal() && Prompter::ask_yes("是否立即重启执行升级？ [y/N]: ", false)
         {
             println!("正在触发离线升级...");
-            let status = CommandRunner::run_status("dnf", ["offline-upgrade", "reboot"])?;
+            // 触发重启的命令随 dnf 世代而异，两者互不兼容：
+            // DNF5 使用 `offline-upgrade reboot`，DNF4 使用 `system-upgrade reboot`。
+            // 必须以实际执行的 dnf 为准，否则升级包已下载却永远无法触发。
+            let reboot_args: &[&OsStr] = if Self::dnf_is_dnf5() {
+                &[OsStr::new("offline-upgrade"), OsStr::new("reboot")]
+            } else {
+                &[OsStr::new("system-upgrade"), OsStr::new("reboot")]
+            };
+            let status = CommandRunner::run_status("dnf", reboot_args.iter().copied())?;
             CommandRunner::ensure_success(status)?;
         } else {
-            println!("\n稍后可手动执行: sudo dnf offline-upgrade reboot");
+            let hint = if Self::dnf_is_dnf5() {
+                "dnf offline-upgrade reboot"
+            } else {
+                "dnf system-upgrade reboot"
+            };
+            println!("\n稍后可手动执行: sudo {hint}");
         }
         Ok(())
+    }
+
+    /// 判断系统上 `dnf` 命令实际属于哪个 DNF 世代
+    ///
+    /// dnf5 的 `--version` 输出首行以 "dnf5" 开头，dnf4 以 "dnf" 开头，
+    /// 因此以实际命令输出为准，避免被两个世代并存时的包名/符号链接迷惑。
+    fn dnf_is_dnf5() -> bool {
+        CommandRunner::run("dnf", ["--version"])
+            .map(|o| {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                stdout
+                    .lines()
+                    .next()
+                    .map(|line| line.starts_with("dnf5"))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
+    /// 探测 dnf 是否支持 system-upgrade 子命令
+    ///
+    /// DNF4 需 dnf-plugin-system-upgrade；DNF5 自 Fedora 42 起内建，
+    /// 更早版本需 dnf5-plugin-system-upgrade。`download --help` 无副作用，
+    /// 支持时退出码为 0。
+    fn supports_system_upgrade() -> bool {
+        CommandRunner::run("dnf", ["system-upgrade", "download", "--help"])
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 }

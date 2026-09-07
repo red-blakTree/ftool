@@ -23,7 +23,7 @@ function __fish_ftool_has_subcommand
     end
     # 如果碰到任何子命令则返回 0
     for cmd in $cmds
-        contains -- $cmd integrated compute hybrid nvidia query power switchable reset cache-create cache-delete cache-query
+        contains -- $cmd integrated hybrid nvidia query power switchable default ext-display runtimepm reset cache-create cache-delete cache-query
         and return 0
     end
     return 1
@@ -54,7 +54,6 @@ complete -c ftool -n "not __fish_seen_subcommand_from -S -U -g -H -h --help -V -
 # ---- -g <操作> ----
 complete -c ftool -n "__fish_seen_subcommand_from -g; and not __fish_ftool_has_subcommand" \
     -xa "integrated\t'仅使用集成显卡 (省电，屏蔽N卡)'
-           compute\t'集显输出 + N卡计算 (省电+GPU计算)'
            hybrid\t'混合模式 (PRIME，按需渲染)'
            nvidia\t'仅使用 NVIDIA 显卡 (高性能)'
            query\t'查询当前显卡模式'
@@ -69,8 +68,8 @@ complete -c ftool -n "__fish_seen_subcommand_from -g; and not __fish_ftool_has_s
 complete -c ftool -n "__fish_seen_subcommand_from -g; and __fish_seen_subcommand_from power" \
     -xa "on\toff\tauto"
 
-# -g integrated / compute / hybrid / nvidia 的高级选项
-for __gpu_mode in integrated compute hybrid nvidia
+# -g integrated / hybrid / nvidia 的高级选项
+for __gpu_mode in integrated hybrid nvidia
     complete -c ftool -n "__fish_seen_subcommand_from -g; and __fish_seen_subcommand_from $__gpu_mode" \
         -l coolbits -r -d "启用 Coolbits (默认值: 28)"
     complete -c ftool -n "__fish_seen_subcommand_from -g; and __fish_seen_subcommand_from $__gpu_mode" \

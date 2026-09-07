@@ -287,20 +287,16 @@ impl GpuDetector {
         let modules = fs::read_to_string("/proc/modules").unwrap_or_default();
         let nvidia_loaded = Self::is_nvidia_module_loaded(&modules);
         let nouveau_loaded = Self::is_nouveau_module_loaded(&modules);
-        let nvidia_drm_loaded = Self::is_nvidia_drm_module_loaded(&modules);
 
         let prime_mode = Self::read_prime_mode();
         let is_integrated = Self::has_integrated_config();
-        let is_compute = Self::has_compute_modprobe_config();
         let has_modeset = Self::has_modeset_config();
 
         Self::classify_mode(
             nvidia_loaded,
             nouveau_loaded,
-            nvidia_drm_loaded,
             &prime_mode,
             is_integrated,
-            is_compute,
             has_modeset,
         )
     }
@@ -318,14 +314,6 @@ fn is_nvidia_module_loaded(modules: &str) -> bool {
     })
 }
 
-/// 检查 /proc/modules 中是否加载了 NVIDIA DRM 模块
-fn is_nvidia_drm_module_loaded(modules: &str) -> bool {
-    modules.lines().any(|line| {
-        let name = line.split_whitespace().next().unwrap_or("");
-        matches!(name, "nvidia_drm" | "nvidia_current_drm")
-    })
-}
-
 /// 检查 /proc/modules 中是否加载了 nouveau 开源驱动
 fn is_nouveau_module_loaded(modules: &str) -> bool {
     modules.lines().any(|line| {
@@ -335,11 +323,27 @@ fn is_nouveau_module_loaded(modules: &str) -> bool {
 }
 
 /// 读取 PRIME 离散模式标志文件内容
+///
+/// 文件缺失视为无标记（首次使用/尚未切换过，属正常状态）；
+/// 文件存在但内容不在 {on, on-demand, off} 白名单内时给出警告，
+/// 避免后续模式分类在静默状态下基于异常内容做出错误判断。
 fn read_prime_mode() -> String {
-    fs::read_to_string(PRIME_DISCRETE_PATH)
-        .unwrap_or_default()
-        .trim()
-        .to_string()
+    match fs::read_to_string(PRIME_DISCRETE_PATH) {
+        Ok(content) => {
+            let mode = content.trim().to_string();
+            if matches!(mode.as_str(), "on" | "on-demand" | "off") {
+                mode
+            } else {
+                warn!(
+                    "{} 内容异常 {:?}，已按无标记处理，模式分类可能不准确",
+                    PRIME_DISCRETE_PATH,
+                    mode
+                );
+                String::new()
+            }
+        }
+        Err(_) => String::new(),
+    }
 }
 
 /// 检查是否存在 Integrated 模式的 udev 配置
@@ -352,29 +356,18 @@ fn has_modeset_config() -> bool {
     Path::new(MODESET_PATH).exists()
 }
 
-/// 检查 modprobe 配置文件内容是否具有 Compute 模式特征
-///（黑名单 nvidia-drm 但不黑名单 nvidia 核心模块）
-fn has_compute_modprobe_config() -> bool {
-    Path::new(MODPROBE_GPU_PATH).exists()
-        && fs::read_to_string(MODPROBE_GPU_PATH)
-            .map(|c| c.contains("blacklist nvidia-drm") && !c.contains("alias nvidia off"))
-            .unwrap_or(false)
-}
-
 /// 综合分类当前 GPU 模式（纯决策函数，不涉及 I/O，便于测试）
 ///
 /// 决策优先级（按顺序）：
 /// 1. NVIDIA 模块未加载 → Integrated
 /// 2. prime-discrete 显式标记 "on" → Nvidia
-/// 3. prime-discrete="on-demand" 或有 modeset 配置 → Hybrid/Compute
+/// 3. prime-discrete="on-demand" 或有 modeset 配置 → Hybrid
 /// 4. NVIDIA 已加载但无特征配置 → Nvidia（保守兜底）
 fn classify_mode(
     nvidia_loaded: bool,
     _nouveau_loaded: bool,
-    nvidia_drm_loaded: bool,
     prime_mode: &str,
     is_integrated: bool,
-    is_compute: bool,
     has_modeset: bool,
 ) -> super::GpuMode {
     // NVIDIA 模块未加载 → Integrated
@@ -398,19 +391,9 @@ fn classify_mode(
         return super::GpuMode::Nvidia;
     }
 
-    // prime-discrete="on-demand" 或有 modeset 配置 → 在 Hybrid/Compute 间区分
+    // prime-discrete="on-demand" 或有 modeset 配置 → Hybrid 模式
     if prime_mode == "on-demand" || has_modeset {
-        // Compute 模式判定依据（二选一满足即可）：
-        // (a) 存在 Compute 特征 modprobe 配置（黑名单 drm 但不黑名单核心模块）
-        // (b) 用户显式设置 prime-discrete="off" 且 nvidia-drm 未加载
-        let looks_like_compute = is_compute
-            || (prime_mode == "off" && !nvidia_drm_loaded);
-
-        return if looks_like_compute {
-            super::GpuMode::Compute
-        } else {
-            super::GpuMode::Hybrid
-        };
+        return super::GpuMode::Hybrid;
     }
 
     // NVIDIA 已加载但无特征配置 → Nvidia（保守兜底）
@@ -431,8 +414,6 @@ fn classify_mode(
         let (nvidia_gpus, _, _) = Self::detect_all_gpus().unwrap_or_default();
         !nvidia_gpus.is_empty()
     }
-
-
 
     /// 检测系统挂起模式：S0ix (s2idle) 或 S3 (deep)
     pub fn detect_sleep_mode() -> SleepMode {

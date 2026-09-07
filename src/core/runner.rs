@@ -39,36 +39,71 @@ impl CommandRunner {
             .spawn()
             .map_err(FtoolError::Io)?;
 
+        // 用独立线程持续排空 stdout/stderr：若子进程输出超过管道缓冲
+        // （默认约 64KiB）而无人读取，子进程会阻塞在 write 上无法退出，
+        // 即使运行正常也会被误判为超时。读线程在管道写端关闭
+        // （进程退出或被杀）后读到 EOF 自然结束。
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let stdout_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stdout_pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        });
+        let stderr_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stderr_pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        });
+
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
 
+        let mut status: Option<ExitStatus> = None;
+        let mut timed_out = false;
         loop {
             match child.try_wait() {
-                Ok(Some(status)) => {
-                    let mut stdout = Vec::new();
-                    let mut stderr = Vec::new();
-                    if let Some(mut s) = child.stdout.take() {
-                        let _ = s.read_to_end(&mut stdout);
-                    }
-                    if let Some(mut s) = child.stderr.take() {
-                        let _ = s.read_to_end(&mut stderr);
-                    }
-                    return Ok(Output { status, stdout, stderr });
+                Ok(Some(s)) => {
+                    status = Some(s);
+                    break;
                 }
                 Ok(None) => {
                     if start.elapsed() >= timeout {
                         let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(FtoolError::Process(format!(
-                            "命令 '{}' 执行超时 ({}s)",
-                            cmd, timeout_secs
-                        )));
+                        timed_out = true;
+                        break;
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                Err(e) => return Err(FtoolError::Io(e)),
+                Err(e) => {
+                    // 尽力终止并回收子进程，避免残留
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(FtoolError::Io(e));
+                }
             }
         }
+
+        // 回收子进程；读线程随后读到 EOF 退出（子进程退出即关闭管道写端）
+        let _ = child.wait();
+        let stdout = stdout_thread.join().unwrap_or_default();
+        let stderr = stderr_thread.join().unwrap_or_default();
+
+        if timed_out {
+            return Err(FtoolError::Process(format!(
+                "命令 '{}' 执行超时 ({}s)，已终止",
+                cmd, timeout_secs
+            )));
+        }
+        Ok(Output {
+            status: status.expect("子进程状态已获取"),
+            stdout,
+            stderr,
+        })
     }
 
     /// 执行命令，仅关心退出状态码（不捕获输出）
