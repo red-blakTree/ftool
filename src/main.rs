@@ -65,12 +65,13 @@ fn main() {
     }
 }
 
+/// 顶层命令分发：每个特性的参数解析、权限检查与执行均由特性自身完成
 fn run(args: &[OsString]) -> Result<(), FtoolError> {
     match args[1].to_str() {
-        Some("-S") => handle_sign_command(args),
-        Some("-U") => handle_upgrade_command(),
+        Some("-S") => features::signer::handle_command(args),
+        Some("-U") => features::upgrader::handle_command(),
         Some("-g") | Some("--graphics") => features::gpu::cli::handle(args),
-        Some("-H") => handle_hash_command(args),
+        Some("-H") => features::hasher::handle_command(args),
         Some("-h") | Some("--help") => {
             print_usage();
             Ok(())
@@ -84,66 +85,4 @@ fn run(args: &[OsString]) -> Result<(), FtoolError> {
             args[1].to_string_lossy()
         ))),
     }
-}
-
-fn handle_sign_command(args: &[OsString]) -> Result<(), FtoolError> {
-    if args.len() < 3 {
-        return Err(FtoolError::Input("-S 参数需要指定内核文件路径".into()));
-    }
-    if args.len() > 3 {
-        return Err(FtoolError::Input(
-            "-S 只接受一个内核文件路径参数（多余参数；路径含空格请用引号包裹）".into(),
-        ));
-    }
-    core::privilege::Privilege::ensure_root()
-        .and_then(|_| features::signer::KernelSigner::sign_kernel(&args[2]))
-}
-
-fn handle_upgrade_command() -> Result<(), FtoolError> {
-    core::privilege::Privilege::ensure_root()
-        .and_then(|_| features::upgrader::Upgrader::perform_upgrade())
-}
-
-fn handle_hash_command(args: &[OsString]) -> Result<(), FtoolError> {
-    if args.len() < 3 {
-        return Err(FtoolError::Input("-H 参数需要指定算法".into()));
-    }
-    let algo = args[2].to_string_lossy();
-
-    if args.len() >= 4
-        && let Some(flag) = args[3].to_str()
-        && (flag == "--string" || flag == "-s")
-    {
-        // 字符串哈希模式
-        if args.len() < 5 {
-            return Err(FtoolError::Input(
-                "-H --string 参数需要指定要哈希的字符串\n\
-                 （若想哈希一个恰好名为 '-s'/'--string' 的文件，请用 './-s' 形式指定路径）"
-                    .into(),
-            ));
-        }
-        if args.len() > 5 {
-            return Err(FtoolError::Input(
-                "-H --string 多余参数（字符串含空格请用引号包裹）".into(),
-            ));
-        }
-        let data = args[4].to_string_lossy();
-        let hash = features::hasher::Hasher::compute_string(&algo, &data)?;
-        println!("{} \"{}\"", hash, data);
-        return Ok(());
-    }
-
-    // 文件哈希模式（现有行为）
-    if args.len() < 4 {
-        return Err(FtoolError::Input("-H 参数需要指定算法和文件路径".into()));
-    }
-    if args.len() > 4 {
-        return Err(FtoolError::Input(
-            "-H 多余参数（文件路径含空格请用引号包裹整个路径）".into(),
-        ));
-    }
-    let path = &args[3];
-    let hash = features::hasher::Hasher::compute(&algo, path)?;
-    println!("{} {}", hash, path.to_string_lossy());
-    Ok(())
 }

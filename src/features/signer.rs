@@ -1,8 +1,9 @@
 use crate::core::FtoolError;
-use crate::core::prompter::Prompter;
+use crate::core::privilege::Privilege;
+use crate::core::prompter::{NonTerminal, Prompter};
 use crate::core::runner::CommandRunner;
 use log::warn;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -24,12 +25,11 @@ impl KernelSigner {
         }
         // 自动安装会触发联网与系统包变更：仅在交互终端经用户确认后执行，
         // 非终端场景（脚本/cron）直接给出手动安装指引
-        if !Prompter::is_terminal()
-            || !Prompter::ask_yes(
-                "📦 未找到 sbsign 命令，是否自动安装 sbsigntools？ [y/N]: ",
-                false,
-            )
-        {
+        if !Prompter::confirm(
+            "📦 未找到 sbsign 命令，是否自动安装 sbsigntools？ [y/N]: ",
+            false,
+            NonTerminal::Deny,
+        ) {
             return Err(FtoolError::Sign(
                 "未找到 sbsign 命令，请先手动安装: sudo dnf install sbsigntools".into(),
             ));
@@ -61,41 +61,23 @@ impl KernelSigner {
         Ok(())
     }
 
-    /// 检查内核是否已使用当前公钥签名（幂等性保护，防止重复签名）
+    /// 使用当前公钥执行 sbverify 校验；`Ok(true)` 表示校验通过。
     ///
-    /// 返回 `Ok(true)` 表示已签名可跳过；`Ok(false)` 表示未签名（或签名不属于当前公钥）。
-    /// 验证工具本身执行失败时返回 `Err`，此时不应盲目继续签名，
+    /// 校验工具本身执行失败时返回 `Err`——此时不应盲目继续签名/替换，
     /// 避免在验证链路已损坏的情况下仍输出"签名完成"。
-    fn is_already_signed(kernel_path: &Path) -> Result<bool, FtoolError> {
+    fn sbverify_passes(path: &Path) -> Result<bool, FtoolError> {
         match CommandRunner::run_status(
             "sbverify",
             [
                 OsStr::new("--cert"),
                 OsStr::new(PUBLIC_KEY),
-                kernel_path.as_os_str(),
+                path.as_os_str(),
             ],
         ) {
             Ok(status) => Ok(status.success()),
             Err(e) => Err(FtoolError::Sign(format!(
-                "无法执行 sbverify 验证当前签名状态，已中止: {e}"
-            ))),
-        }
-    }
-
-    /// 校验临时签名产物，通过才允许替换原文件
-    fn verify_signature(tmp: &Path) -> Result<(), FtoolError> {
-        match CommandRunner::run_status(
-            "sbverify",
-            [
-                OsStr::new("--cert"),
-                OsStr::new(PUBLIC_KEY),
-                tmp.as_os_str(),
-            ],
-        ) {
-            Ok(status) if status.success() => Ok(()),
-            Ok(_) => Err(FtoolError::Sign("签名产物未通过 sbverify 校验".into())),
-            Err(e) => Err(FtoolError::Sign(format!(
-                "无法执行 sbverify 校验签名产物: {e}"
+                "无法执行 sbverify 校验 {}: {e}",
+                path.display()
             ))),
         }
     }
@@ -145,22 +127,21 @@ impl KernelSigner {
         })?;
 
         // 幂等性检查：如果已经签名，直接跳过
-        if Self::is_already_signed(&real_path)? {
+        if Self::sbverify_passes(&real_path)? {
             println!("⏭️ 内核已持有当前公钥的签名，跳过: {}", real_path.display());
             return Ok(());
         }
 
         // 覆盖引导文件是不可逆操作，终端交互下先请用户确认
         // （非终端场景跳过确认，与 -U 升级命令的交互约定一致）
-        if Prompter::is_terminal()
-            && !Prompter::ask_yes(
-                &format!(
-                    "即将覆盖签名内核文件: {}\n是否继续？ [y/N]: ",
-                    real_path.display()
-                ),
-                false,
-            )
-        {
+        if !Prompter::confirm(
+            &format!(
+                "即将覆盖签名内核文件: {}\n是否继续？ [y/N]: ",
+                real_path.display()
+            ),
+            false,
+            NonTerminal::Allow,
+        ) {
             println!("已取消签名。");
             return Ok(());
         }
@@ -217,9 +198,13 @@ impl KernelSigner {
         }
 
         // 替换前校验签名产物，避免把损坏/无效的产物覆盖到引导文件上
-        if let Err(e) = Self::verify_signature(tmp) {
+        if !Self::sbverify_passes(tmp).inspect_err(|_| {
             let _ = fs::remove_file(tmp);
-            return Err(FtoolError::Sign(format!("{e}，已保留原内核文件")));
+        })? {
+            let _ = fs::remove_file(tmp);
+            return Err(FtoolError::Sign(
+                "签名产物未通过 sbverify 校验，已保留原内核文件".into(),
+            ));
         }
 
         // 确保签名产物落盘，缩小断电留下空/损坏文件的窗口
@@ -248,7 +233,6 @@ impl KernelSigner {
             ));
         }
         // 权限元数据也需落盘后再 rename（首次 sync 发生在设置权限之前）
-        // 权限元数据也需落盘后再 rename（首次 sync 发生在设置权限之前）
         fs::File::open(tmp)
             .and_then(|f| f.sync_all())
             .map_err(|e| Self::commit_failed(tmp, bak, &real_path, "同步签名产物权限", e))?;
@@ -272,5 +256,89 @@ impl KernelSigner {
 
         println!("签名完成: {}", real_path.display());
         Ok(())
+    }
+}
+
+/// 处理 `-S` 命令：参数校验 + root 检查后执行内核签名
+pub fn handle_command(args: &[OsString]) -> Result<(), FtoolError> {
+    if args.len() < 3 {
+        return Err(FtoolError::Input("-S 参数需要指定内核文件路径".into()));
+    }
+    if args.len() > 3 {
+        return Err(FtoolError::Input(
+            "-S 只接受一个内核文件路径参数（多余参数；路径含空格请用引号包裹）".into(),
+        ));
+    }
+    Privilege::ensure_root().and_then(|_| KernelSigner::sign_kernel(&args[2]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------- commit_failed：提交阶段失败的统一收尾 ----------
+
+    /// 成功场景：临时产物被清理，备份回滚到原路径，错误消息带恢复说明
+    #[test]
+    fn commit_failed_cleans_tmp_and_rolls_back_bak() {
+        let dir = std::env::temp_dir().join(format!("ftool-sign-rollback-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join("tmp");
+        let bak = dir.join("bak");
+        let real = dir.join("real");
+        std::fs::write(&tmp, b"signed").unwrap();
+        std::fs::write(&bak, b"original").unwrap();
+
+        let err = KernelSigner::commit_failed(
+            &tmp,
+            &bak,
+            &real,
+            "设置签名产物权限",
+            std::io::Error::other("模拟失败"),
+        );
+
+        assert!(!tmp.exists(), "临时签名产物应被清理");
+        assert!(!bak.exists(), "备份应已被移回原路径");
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "original",
+            "原文件应从备份恢复"
+        );
+        match err {
+            FtoolError::Sign(msg) => {
+                assert!(msg.contains("设置签名产物权限失败"));
+                assert!(msg.contains("已自动恢复原文件"));
+            }
+            other => panic!("期望 Sign 错误，实际: {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&real);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// 回滚失败场景（备份缺失）：错误消息应指明恢复失败并保留备份路径信息
+    #[test]
+    fn commit_failed_reports_when_rollback_impossible() {
+        let dir = std::env::temp_dir().join(format!("ftool-sign-nobak-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join("tmp");
+        let bak = dir.join("missing_bak"); // 故意不创建：回滚将失败
+        let real = dir.join("real");
+        std::fs::write(&tmp, b"signed").unwrap();
+
+        let err = KernelSigner::commit_failed(&tmp, &bak, &real, "替换内核文件", "磁盘错误");
+
+        assert!(!tmp.exists(), "临时签名产物仍应被清理");
+        assert!(!real.exists(), "回滚失败时原路径不应出现文件");
+        match err {
+            FtoolError::Sign(msg) => {
+                assert!(msg.contains("替换内核文件失败"));
+                assert!(msg.contains("且恢复原文件失败"));
+                assert!(msg.contains("missing_bak"), "消息应包含备份路径: {msg}");
+            }
+            other => panic!("期望 Sign 错误，实际: {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir(&dir);
     }
 }

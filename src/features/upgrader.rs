@@ -1,5 +1,6 @@
 use crate::core::FtoolError;
-use crate::core::prompter::Prompter;
+use crate::core::privilege::Privilege;
+use crate::core::prompter::{NonTerminal, Prompter};
 use crate::core::runner::CommandRunner;
 use std::ffi::OsStr;
 
@@ -7,44 +8,61 @@ use std::ffi::OsStr;
 pub struct Upgrader;
 
 impl Upgrader {
+    /// 从 /etc/fedora-release 内容解析主版本号（纯函数，便于测试）。
+    ///
+    /// 典型内容形如 `Fedora release 40 (Forty)`，取 "release" 关键字后的首个数字。
+    fn release_from_fedora_release(content: &str) -> Option<u32> {
+        let pos = content.find("release")?;
+        let rest = &content[pos + 7..];
+        rest.split_whitespace().find_map(|word| word.parse().ok())
+    }
+
+    /// 从 /etc/os-release 内容解析 VERSION_ID（纯函数，便于测试）。
+    fn release_from_os_release(content: &str) -> Option<u32> {
+        content.lines().find_map(|line| {
+            line.strip_prefix("VERSION_ID=")
+                .and_then(|v| v.trim_matches('"').parse().ok())
+        })
+    }
+
     /// 检测当前 Fedora 主版本号
     ///
     /// 优先从 /etc/fedora-release 解析，降级到 /etc/os-release。
     fn fedora_version() -> Result<u32, FtoolError> {
-        // 优先解析 /etc/fedora-release
-        if let Ok(content) = std::fs::read_to_string("/etc/fedora-release") {
-            // 查找 "release" 关键字后的数字
-            if let Some(pos) = content.find("release") {
-                let rest = &content[pos + 7..];
-                for word in rest.split_whitespace() {
-                    if let Ok(v) = word.parse() {
-                        return Ok(v);
-                    }
-                }
-            }
+        if let Ok(content) = std::fs::read_to_string("/etc/fedora-release")
+            && let Some(v) = Self::release_from_fedora_release(&content)
+        {
+            return Ok(v);
         }
-
-        // 降级解析 /etc/os-release
-        if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
-            for line in content.lines() {
-                if let Some(v) = line.strip_prefix("VERSION_ID=")
-                    && let Ok(n) = v.trim_matches('"').parse()
-                {
-                    return Ok(n);
-                }
-            }
+        if let Ok(content) = std::fs::read_to_string("/etc/os-release")
+            && let Some(v) = Self::release_from_os_release(&content)
+        {
+            return Ok(v);
         }
         Err(FtoolError::Upgrade("无法检测 Fedora 版本".into()))
     }
 
     /// 执行 Fedora 系统大版本升级（如 Fedora 40 → 41）
+    ///
+    /// 流程编排：人工确认 → 可用性检测 → 可选更新当前系统 → 能力探测 →
+    /// 下载软件包 → 触发离线重启（或给出手动命令）。
     pub fn perform_upgrade() -> Result<(), FtoolError> {
         let cur = Self::fedora_version()?;
         let next = cur + 1;
         println!("\n⚠️ 即将进行系统升级: Fedora {cur} → {next}");
 
-        // 升级是不可逆的大动作：非交互终端（管道/脚本/cron）下禁止自动放行，
-        // 必须由人工在终端确认后才继续
+        Self::confirm_upgrade()?;
+        Self::ensure_release_available(next)?;
+        Self::maybe_update_current()?;
+        Self::ensure_system_upgrade_supported()?;
+        Self::download_packages(next)?;
+        Self::reboot_or_hint()?;
+        Ok(())
+    }
+
+    /// 第一步确认：升级是不可逆的大动作，非交互终端（管道/脚本/cron）下禁止
+    /// 自动放行，必须由人工在终端确认后才继续
+    fn confirm_upgrade() -> Result<(), FtoolError> {
         if !Prompter::is_terminal() {
             return Err(FtoolError::Upgrade(
                 "stdin 不是交互终端，已中止升级（升级操作必须人工在终端确认）".into(),
@@ -54,7 +72,11 @@ impl Upgrader {
             println!("已取消升级。");
             return Ok(());
         }
+        Ok(())
+    }
 
+    /// [1/3] 检测目标版本软件源可用性（dnf check-update 退出码 0/100 表示可用）
+    fn ensure_release_available(next: u32) -> Result<(), FtoolError> {
         println!("\n[1/3] 检测 Fedora {next} 可用性...");
         let ver = next.to_string();
 
@@ -70,19 +92,25 @@ impl Upgrader {
                 )));
             }
         }
+        Ok(())
+    }
 
-        // 可选：先更新当前系统
-        if Prompter::is_terminal() && Prompter::ask_yes("是否先更新当前系统？ [y/N]: ", false)
-        {
+    /// 可选：先更新当前系统到最新状态
+    fn maybe_update_current() -> Result<(), FtoolError> {
+        if Prompter::confirm("是否先更新当前系统？ [y/N]: ", false, NonTerminal::Deny) {
             println!("\n📦 更新当前系统...");
             let status = CommandRunner::run_status("dnf", ["upgrade", "--refresh"])?;
             CommandRunner::ensure_success(status)?;
         }
+        Ok(())
+    }
 
-        // 检查 dnf 是否支持 system-upgrade（能力探测：--help 无副作用）
-        // DNF4 需要 dnf-plugin-system-upgrade；DNF5 在 Fedora 42+ 已内建，
-        // 更早版本需要 dnf5-plugin-system-upgrade——插件包名随 dnf 世代而变，
-        // 不能硬编码包名，故直接探测子命令是否可用。
+    /// 检查 dnf 是否支持 system-upgrade（能力探测：--help 无副作用）
+    ///
+    /// DNF4 需要 dnf-plugin-system-upgrade；DNF5 在 Fedora 42+ 已内建，
+    /// 更早版本需要 dnf5-plugin-system-upgrade——插件包名随 dnf 世代而变，
+    /// 不能硬编码包名，故直接探测子命令是否可用。
+    fn ensure_system_upgrade_supported() -> Result<(), FtoolError> {
         if !Self::supports_system_upgrade() {
             let pkg = if Self::dnf_is_dnf5() {
                 "dnf5-plugin-system-upgrade"
@@ -93,13 +121,20 @@ impl Upgrader {
                 "当前 dnf 不支持 system-upgrade，请先安装:\n  sudo dnf install {pkg}"
             )));
         }
+        Ok(())
+    }
 
+    /// [2/3] 下载目标版本软件包（可选禁用 COPR 仓库防止依赖冲突）
+    fn download_packages(next: u32) -> Result<(), FtoolError> {
         println!("\n[2/3] 下载 Fedora {next} 软件包...");
+        let ver = next.to_string();
         let download_args: Vec<&OsStr> = {
             let mut args = Vec::new();
-            if Prompter::is_terminal()
-                && Prompter::ask_yes("是否禁用 COPR 仓库防止冲突？ [y/N]: ", false)
-            {
+            if Prompter::confirm(
+                "是否禁用 COPR 仓库防止冲突？ [y/N]: ",
+                false,
+                NonTerminal::Deny,
+            ) {
                 args.push(OsStr::new("--setopt=copr:*.enabled=0"));
             }
             args.extend_from_slice(&[
@@ -111,10 +146,13 @@ impl Upgrader {
             args
         };
         let status = CommandRunner::run_status("dnf", &download_args)?;
-        CommandRunner::ensure_success(status)?;
+        CommandRunner::ensure_success(status)
+    }
 
+    /// [3/3] 询问是否立即重启执行离线升级；否则打印手动触发命令
+    fn reboot_or_hint() -> Result<(), FtoolError> {
         println!("\n[3/3] 准备重启升级...");
-        if Prompter::is_terminal() && Prompter::ask_yes("是否立即重启执行升级？ [y/N]: ", false)
+        if Prompter::confirm("是否立即重启执行升级？ [y/N]: ", false, NonTerminal::Deny)
         {
             println!("正在触发离线升级...");
             // 触发重启的命令随 dnf 世代而异，两者互不兼容：
@@ -164,5 +202,57 @@ impl Upgrader {
         CommandRunner::run("dnf", ["system-upgrade", "download", "--help"])
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+}
+
+/// 处理 `-U` 命令：root 检查后执行系统升级
+pub fn handle_command() -> Result<(), FtoolError> {
+    Privilege::ensure_root().and_then(|_| Upgrader::perform_upgrade())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Upgrader;
+
+    // ---------- 版本号解析 ----------
+
+    #[test]
+    fn fedora_release_typical() {
+        let out = Upgrader::release_from_fedora_release("Fedora release 40 (Forty)");
+        assert_eq!(out, Some(40));
+    }
+
+    #[test]
+    fn fedora_release_rawhide() {
+        // Rawhide 没有版本号数字：应返回 None，由调用方继续降级解析
+        assert_eq!(
+            Upgrader::release_from_fedora_release("Fedora release Rawhide"),
+            None
+        );
+    }
+
+    #[test]
+    fn fedora_release_missing_keyword() {
+        assert_eq!(
+            Upgrader::release_from_fedora_release("no version here"),
+            None
+        );
+    }
+
+    #[test]
+    fn os_release_quoted_version() {
+        let content = "NAME=\"Fedora Linux\"\nVERSION=\"40 (Forty)\"\nVERSION_ID=\"40\"\n";
+        assert_eq!(Upgrader::release_from_os_release(content), Some(40));
+    }
+
+    #[test]
+    fn os_release_unquoted_version() {
+        let content = "VERSION_ID=41\nID=fedora\n";
+        assert_eq!(Upgrader::release_from_os_release(content), Some(41));
+    }
+
+    #[test]
+    fn os_release_missing() {
+        assert_eq!(Upgrader::release_from_os_release("ID=fedora\n"), None);
     }
 }

@@ -1,6 +1,6 @@
 use crate::core::FtoolError;
 use digest::Digest;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read};
 
@@ -18,7 +18,7 @@ impl Hasher {
     /// 小写十六进制字符串表示的哈希值
     pub fn compute(algo: &str, path: &OsStr) -> Result<String, FtoolError> {
         let file = File::open(path).map_err(|e| {
-            FtoolError::Input(format!("无法打开文件 '{}': {}", path.to_string_lossy(), e))
+            FtoolError::File(format!("无法打开文件 '{}': {}", path.to_string_lossy(), e))
         })?;
         const BUF_SIZE: usize = 1024 * 1024; // 1MiB 缓冲区
         let mut reader = BufReader::with_capacity(BUF_SIZE, file);
@@ -62,7 +62,7 @@ impl Hasher {
         loop {
             let n = reader
                 .read(&mut buffer)
-                .map_err(|e| FtoolError::Input(format!("读取文件失败: {}", e)))?;
+                .map_err(|e| FtoolError::File(format!("读取文件失败: {}", e)))?;
             if n == 0 {
                 break;
             }
@@ -78,6 +78,51 @@ impl Hasher {
         }
         Ok(String::from_utf8(hex_bytes).unwrap())
     }
+}
+
+/// 处理 `-H` 命令：解析算法与文件/字符串参数，计算并打印哈希
+pub fn handle_command(args: &[OsString]) -> Result<(), FtoolError> {
+    if args.len() < 3 {
+        return Err(FtoolError::Input("-H 参数需要指定算法".into()));
+    }
+    let algo = args[2].to_string_lossy();
+
+    if args.len() >= 4
+        && let Some(flag) = args[3].to_str()
+        && (flag == "--string" || flag == "-s")
+    {
+        // 字符串哈希模式
+        if args.len() < 5 {
+            return Err(FtoolError::Input(
+                "-H --string 参数需要指定要哈希的字符串\n\
+                 （若想哈希一个恰好名为 '-s'/'--string' 的文件，请用 './-s' 形式指定路径）"
+                    .into(),
+            ));
+        }
+        if args.len() > 5 {
+            return Err(FtoolError::Input(
+                "-H --string 多余参数（字符串含空格请用引号包裹）".into(),
+            ));
+        }
+        let data = args[4].to_string_lossy();
+        let hash = Hasher::compute_string(&algo, &data)?;
+        println!("{} \"{}\"", hash, data);
+        return Ok(());
+    }
+
+    // 文件哈希模式
+    if args.len() < 4 {
+        return Err(FtoolError::Input("-H 参数需要指定算法和文件路径".into()));
+    }
+    if args.len() > 4 {
+        return Err(FtoolError::Input(
+            "-H 多余参数（文件路径含空格请用引号包裹整个路径）".into(),
+        ));
+    }
+    let path = &args[3];
+    let hash = Hasher::compute(&algo, path)?;
+    println!("{} {}", hash, path.to_string_lossy());
+    Ok(())
 }
 
 #[cfg(test)]
