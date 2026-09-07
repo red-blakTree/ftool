@@ -1,5 +1,20 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 
+/// 非终端（stdin 非交互，如脚本/管道/cron）场景下确认问题的降级策略
+///
+/// 同一段确认逻辑在终端与非终端下的合理行为可能不同：
+/// - 危险/不可逆操作（自动安装、强制门禁）应默认拒绝，避免脚本静默执行；
+/// - 幂等/可跳过流程（覆盖确认等）应默认放行，避免脚本流程被卡住。
+///
+/// 策略在调用点显式声明，消除散落各处的 `is_terminal()` 组合判断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonTerminal {
+    /// 视同用户未确认（返回 `false`），安全默认
+    Deny,
+    /// 视同用户已确认（返回 `true`）
+    Allow,
+}
+
 /// 交互式提示工具
 pub struct Prompter;
 
@@ -38,5 +53,15 @@ impl Prompter {
     /// 判断标准输入是否为终端（而非管道重定向）
     pub fn is_terminal() -> bool {
         io::stdin().is_terminal()
+    }
+
+    /// 终端交互下询问 yes/no 确认；非终端下按 [`NonTerminal`] 策略直接降级。
+    ///
+    /// 终端行为与 [`Self::ask_yes`] 一致（回车返回 `default`）。
+    pub fn confirm(prompt: &str, default: bool, non_terminal: NonTerminal) -> bool {
+        if !Self::is_terminal() {
+            return non_terminal == NonTerminal::Allow;
+        }
+        Self::ask_yes(prompt, default)
     }
 }

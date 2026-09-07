@@ -13,7 +13,7 @@ impl Privilege {
         if unsafe { libc::geteuid() } == 0 {
             Ok(())
         } else {
-            Err(FtoolError::Process(
+            Err(FtoolError::Permission(
                 "此操作需要 root 权限，请使用 sudo 执行".into(),
             ))
         }
@@ -22,6 +22,6 @@ impl Privilege {
     /// 非 Linux 系统不支持此工具
     #[cfg(not(target_os = "linux"))]
     pub fn ensure_root() -> Result<(), FtoolError> {
-        Err(FtoolError::Process("此操作仅支持 Linux 系统".into()))
+        Err(FtoolError::Permission("此操作仅支持 Linux 系统".into()))
     }
 }
