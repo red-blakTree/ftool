@@ -100,6 +100,29 @@ impl KernelSigner {
         }
     }
 
+    /// 提交阶段（原文件已移为备份后）任一步骤失败的统一收尾：
+    /// 删除临时签名产物，把备份恢复回原路径，并组装带恢复结果的错误。
+    ///
+    /// 调用点包括：设置签名产物权限失败、权限元数据落盘失败、替换原文件失败。
+    fn commit_failed(
+        tmp: &Path,
+        bak: &Path,
+        real_path: &Path,
+        step: &str,
+        cause: impl std::fmt::Display,
+    ) -> FtoolError {
+        let _ = fs::remove_file(tmp); // 清理临时签名产物
+        let rollback = fs::rename(bak, real_path);
+        FtoolError::Sign(format!(
+            "{step}失败: {cause}；{}",
+            if rollback.is_ok() {
+                "已自动恢复原文件".to_string()
+            } else {
+                format!("且恢复原文件失败，原文件保留在 {}", bak.display())
+            }
+        ))
+    }
+
     /// 对指定的内核文件执行签名
     ///
     /// 签名流程：
@@ -216,45 +239,23 @@ impl KernelSigner {
         // 0600 等收紧权限）：rename 后新文件直接以目标权限可见，不存在"先 0644
         // 落盘、再事后收窄"的瞬时放宽窗口；失败时回滚备份并中止
         if let Err(e) = fs::set_permissions(tmp, fs::Permissions::from_mode(original_mode)) {
-            let _ = fs::remove_file(tmp);
-            let rollback = fs::rename(bak, &real_path);
-            return Err(FtoolError::Sign(format!(
-                "设置签名产物权限失败: {e}；{}",
-                if rollback.is_ok() {
-                    "已自动恢复原文件".to_string()
-                } else {
-                    format!("且恢复原文件失败，原文件保留在 {}", bak.display())
-                }
-            )));
+            return Err(Self::commit_failed(
+                tmp,
+                bak,
+                &real_path,
+                "设置签名产物权限",
+                e,
+            ));
         }
+        // 权限元数据也需落盘后再 rename（首次 sync 发生在设置权限之前）
         // 权限元数据也需落盘后再 rename（首次 sync 发生在设置权限之前）
         fs::File::open(tmp)
             .and_then(|f| f.sync_all())
-            .map_err(|e| {
-                let _ = fs::remove_file(tmp);
-                let rollback = fs::rename(bak, &real_path);
-                FtoolError::Sign(format!(
-                    "同步签名产物权限失败: {e}；{}",
-                    if rollback.is_ok() {
-                        "已自动恢复原文件".to_string()
-                    } else {
-                        format!("且恢复原文件失败，原文件保留在 {}", bak.display())
-                    }
-                ))
-            })?;
+            .map_err(|e| Self::commit_failed(tmp, bak, &real_path, "同步签名产物权限", e))?;
 
         // 临时文件和目标文件在同一分区，fs::rename 保证原子操作
         if let Err(e) = fs::rename(tmp, &real_path) {
-            let _ = fs::remove_file(tmp);
-            let rollback = fs::rename(bak, &real_path);
-            return Err(FtoolError::Sign(format!(
-                "替换内核文件失败: {e}；{}",
-                if rollback.is_ok() {
-                    "已自动恢复原文件".to_string()
-                } else {
-                    format!("且恢复原文件失败，原文件保留在 {}", bak.display())
-                }
-            )));
+            return Err(Self::commit_failed(tmp, bak, &real_path, "替换内核文件", e));
         }
 
         // 签名成功：清理备份，并同步父目录保证目录项落盘
