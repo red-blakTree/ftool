@@ -95,6 +95,44 @@ pub fn create_file_bytes(path: &str, content: &[u8]) -> Result<(), FtoolError> {
     write_file_atomic(path, content, false)
 }
 
+/// SDDM Xsetup 的清理动作（由决策纯函数返回，IO 由调用方执行）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XsetupCleanup {
+    /// 备份为原始内容且当前 Xsetup 为 ftool 生成（或已被删除）：用备份恢复 Xsetup
+    Restore,
+    /// 备份本身是 ftool 产物且当前 Xsetup 亦为 ftool 生成：两者均删除
+    RemoveXsetupAndBak,
+    /// 备份本身是 ftool 产物（原始备份已被早期版本覆盖丢失）：仅删除备份
+    RemoveBakOnly,
+    /// 当前 Xsetup 非 ftool 生成（用户修改/包更新）：保留现状与备份
+    Keep,
+}
+
+/// SDDM Xsetup 恢复/清理决策表（纯函数，便于测试）。
+///
+/// 前提：备份文件已存在（由调用方保证）。备份可能本身是 ftool 生成的脚本——
+/// 早期版本在重复切换时会把 ftool 脚本自身写为备份，覆盖掉真正的原始备份，
+/// 此时原始内容已不可恢复，只能清理 ftool 痕迹而不是把 ftool 脚本写回 Xsetup。
+fn decide_xsetup_cleanup(
+    xsetup_exists: bool,
+    xsetup_is_ftool: bool,
+    bak_is_ftool: bool,
+) -> XsetupCleanup {
+    if bak_is_ftool {
+        if xsetup_is_ftool {
+            XsetupCleanup::RemoveXsetupAndBak
+        } else {
+            XsetupCleanup::RemoveBakOnly
+        }
+    } else if !xsetup_exists || xsetup_is_ftool {
+        // 当前 Xsetup 为 ftool 生成（或已被删除）：用原始备份恢复
+        XsetupCleanup::Restore
+    } else {
+        // 当前 Xsetup 非 ftool 生成：可能是包更新或用户手工修改，不覆盖
+        XsetupCleanup::Keep
+    }
+}
+
 /// 清理所有由 ftool 生成的系统配置文件
 pub fn cleanup() -> Result<(), FtoolError> {
     info!("🧹 清理旧的配置文件...");
@@ -171,29 +209,33 @@ pub fn cleanup() -> Result<(), FtoolError> {
         }
     }
 
-    // 还原 SDDM Xsetup：备份存在时，仅当当前 Xsetup 确为 ftool 生成（或已被删除）
-    // 才用备份恢复，避免冲掉包更新后或用户手工修改的内容；备份本身若是 ftool
-    // 生成的脚本（早期版本重复切换会覆盖原始备份），原始内容已不可恢复，
-    // 此时清理 ftool 痕迹而不是把 ftool 脚本写回 Xsetup。
-    if Path::new(SDDM_XSETUP_BAK_PATH).exists() {
-        match fs::read(SDDM_XSETUP_BAK_PATH) {
-            Ok(bak) => {
-                let bak_is_ftool = bak.starts_with(FTOOL_MARKER.as_bytes());
-                let current_is_ftool = fs::read(SDDM_XSETUP_PATH)
-                    .map(|c| c.starts_with(FTOOL_MARKER.as_bytes()))
-                    .unwrap_or(false);
-                if bak_is_ftool {
-                    warn!(
-                        "SDDM Xsetup 备份内容为 ftool 自身生成（原始备份可能已被早期版本覆盖丢失），不执行恢复; backup={}",
-                        SDDM_XSETUP_BAK_PATH
-                    );
-                    if current_is_ftool && let Err(e) = fs::remove_file(SDDM_XSETUP_PATH) {
-                        warn!("删除 ftool 生成的 SDDM Xsetup 失败: {}", e);
-                    }
-                    fs::remove_file(SDDM_XSETUP_BAK_PATH).map_err(|e| {
-                        FtoolError::Gpu(format!("删除 SDDM Xsetup 备份失败: {}", e))
-                    })?;
-                } else if current_is_ftool || !Path::new(SDDM_XSETUP_PATH).exists() {
+    // 还原 SDDM Xsetup：恢复/清理动作由纯函数 decide_xsetup_cleanup 决策，
+    // 此处仅执行 IO（读取、按动作写入/删除/恢复）
+    match fs::read(SDDM_XSETUP_BAK_PATH) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // 无备份（旧版本可能未保留备份）：仅删除能确认由 ftool 生成的 Xsetup
+            if let Ok(content) = fs::read(SDDM_XSETUP_PATH)
+                && content.starts_with(FTOOL_MARKER.as_bytes())
+            {
+                debug!(
+                    "删除旧版 ftool 生成的 SDDM Xsetup; path={}",
+                    SDDM_XSETUP_PATH
+                );
+                fs::remove_file(SDDM_XSETUP_PATH)
+                    .map_err(|e| FtoolError::Gpu(format!("删除 SDDM Xsetup 失败: {}", e)))?;
+            }
+        }
+        Err(e) => {
+            warn!("读取 SDDM Xsetup 备份失败: {}", e);
+        }
+        Ok(bak) => {
+            let bak_is_ftool = bak.starts_with(FTOOL_MARKER.as_bytes());
+            let xsetup_exists = Path::new(SDDM_XSETUP_PATH).exists();
+            let xsetup_is_ftool = fs::read(SDDM_XSETUP_PATH)
+                .map(|c| c.starts_with(FTOOL_MARKER.as_bytes()))
+                .unwrap_or(false);
+            match decide_xsetup_cleanup(xsetup_exists, xsetup_is_ftool, bak_is_ftool) {
+                XsetupCleanup::Restore => {
                     debug!("还原 SDDM Xsetup 备份; path={}", SDDM_XSETUP_PATH);
                     let mode = fs::metadata(SDDM_XSETUP_BAK_PATH)
                         .map_err(|e| {
@@ -209,27 +251,36 @@ pub fn cleanup() -> Result<(), FtoolError> {
                     fs::remove_file(SDDM_XSETUP_BAK_PATH).map_err(|e| {
                         FtoolError::Gpu(format!("删除 SDDM Xsetup 备份失败: {}", e))
                     })?;
-                } else {
+                }
+                XsetupCleanup::RemoveXsetupAndBak => {
+                    warn!(
+                        "SDDM Xsetup 备份内容为 ftool 自身生成（原始备份可能已被早期版本覆盖丢失），删除 ftool 痕迹; backup={}",
+                        SDDM_XSETUP_BAK_PATH
+                    );
+                    if let Err(e) = fs::remove_file(SDDM_XSETUP_PATH) {
+                        warn!("删除 ftool 生成的 SDDM Xsetup 失败: {}", e);
+                    }
+                    fs::remove_file(SDDM_XSETUP_BAK_PATH).map_err(|e| {
+                        FtoolError::Gpu(format!("删除 SDDM Xsetup 备份失败: {}", e))
+                    })?;
+                }
+                XsetupCleanup::RemoveBakOnly => {
+                    warn!(
+                        "SDDM Xsetup 备份内容为 ftool 自身生成（原始备份可能已被早期版本覆盖丢失），保留当前 Xsetup 并删除备份; backup={}",
+                        SDDM_XSETUP_BAK_PATH
+                    );
+                    fs::remove_file(SDDM_XSETUP_BAK_PATH).map_err(|e| {
+                        FtoolError::Gpu(format!("删除 SDDM Xsetup 备份失败: {}", e))
+                    })?;
+                }
+                XsetupCleanup::Keep => {
                     warn!(
                         "当前 {} 非 ftool 生成（可能已被包更新或用户修改），跳过备份恢复并保留备份",
                         SDDM_XSETUP_PATH
                     );
                 }
             }
-            Err(e) => {
-                warn!("读取 SDDM Xsetup 备份失败: {}", e);
-            }
         }
-    } else if let Ok(content) = fs::read(SDDM_XSETUP_PATH)
-        && content.starts_with(FTOOL_MARKER.as_bytes())
-    {
-        // 无备份但 Xsetup 为 ftool 生成（旧版本写入）：删除以还原包默认状态
-        debug!(
-            "删除旧版 ftool 生成的 SDDM Xsetup; path={}",
-            SDDM_XSETUP_PATH
-        );
-        fs::remove_file(SDDM_XSETUP_PATH)
-            .map_err(|e| FtoolError::Gpu(format!("删除 SDDM Xsetup 失败: {}", e)))?;
     }
 
     Ok(())
@@ -463,6 +514,54 @@ pub fn set_prime_discrete(mode: &str) -> Result<(), FtoolError> {
     create_file(PRIME_DISCRETE_PATH, &format!("{}\n", mode), false)
 }
 
+/// 计算挂起电源管理参数合并后的目标文件内容（纯函数，便于测试）。
+///
+/// 返回 `Some(content)` 表示需要写入（目标内容与 `existing` 不同），`None`
+/// 表示文件已是最新、无需写入。规则：
+/// - 剔除另一挂起模式（S0ix/S3 互斥）的参数残留行；
+/// - 当前模式参数行已存在时保持剔除后的内容不变（幂等）；
+/// - 缺少参数行时补写参数行，并确保 ftool 生成标记头存在且不重复。
+fn build_sleep_config_content(
+    existing: &str,
+    sleep_text: &str,
+    key_line: &str,
+    other_key: &str,
+) -> Option<String> {
+    const HEADER: &str = "# Automatically generated by ftool";
+
+    // 剔除另一挂起模式的参数行（S0ix/S3 参数不可并存）
+    let lines: Vec<&str> = existing
+        .lines()
+        .filter(|l| !l.contains(other_key))
+        .collect();
+
+    // 幂等判断只认非注释的参数行，避免注释等相似文本误判为已配置
+    let has_key = lines
+        .iter()
+        .any(|l| !l.trim_start().starts_with('#') && l.contains(key_line));
+
+    let mut merged = String::new();
+    if !has_key {
+        if !lines.iter().any(|l| l.trim() == HEADER) {
+            merged.push_str(HEADER);
+            merged.push('\n');
+        }
+        for l in &lines {
+            merged.push_str(l.trim_end());
+            merged.push('\n');
+        }
+        merged.push_str(sleep_text.trim());
+        merged.push('\n');
+    } else {
+        merged = lines.join("\n");
+        if !merged.ends_with('\n') {
+            merged.push('\n');
+        }
+    }
+
+    (merged != existing).then_some(merged)
+}
+
 /// 根据系统挂起模式，追加对应的 NVIDIA 电源管理配置
 ///
 /// Integrated 模式下此函数为 no-op（不写入任何睡眠配置）。
@@ -501,41 +600,9 @@ pub fn append_sleep_config(mode: super::GpuMode) -> Result<(), FtoolError> {
     // 读取现有内容（文件可能不存在）
     let existing = fs::read_to_string(path).unwrap_or_default();
     let sleep_text = String::from_utf8_lossy(sleep_content);
-    // S0ix 与 S3 两种挂起参数不可并存：剔除另一种模式的参数行，避免系统挂起
-    // 方式变更后两份 options 同时生效（行为取决于驱动解析顺序）
-    let lines: Vec<&str> = existing
-        .lines()
-        .filter(|l| !l.contains(other_key))
-        .collect();
-
-    // 幂等判断基于"剔除后内容是否已含当前模式参数"，不用整文件子串 contains，
-    // 避免注释等相似文本造成的误判；剔除结果必须落盘（曾因"已存在即跳过写入"
-    // 导致另一种模式的残留行永远无法被清除）
-    const HEADER: &str = "# Automatically generated by ftool";
-    let has_key = lines
-        .iter()
-        .any(|l| !l.trim_start().starts_with('#') && l.contains(key_line));
-
-    let mut merged = String::new();
-    if !has_key {
-        if !lines.iter().any(|l| l.trim() == HEADER) {
-            merged.push_str(HEADER);
-            merged.push('\n');
-        }
-        for l in &lines {
-            merged.push_str(l.trim_end());
-            merged.push('\n');
-        }
-        merged.push_str(sleep_text.trim());
-        merged.push('\n');
-    } else {
-        merged = lines.join("\n");
-        if !merged.ends_with('\n') {
-            merged.push('\n');
-        }
-    }
-
-    if merged != existing {
+    // 目标内容由纯函数计算（剔除另一挂起模式残留、补写参数、幂等判断），
+    // 与磁盘当前内容不同才原子写入
+    if let Some(merged) = build_sleep_config_content(&existing, &sleep_text, key_line, other_key) {
         create_file(path, &merged, false)?;
     } else {
         debug!("挂起配置已是最新，跳过写入");
@@ -986,5 +1053,119 @@ impl ConfigSnapshot {
         }
 
         info!("配置快照恢复完成");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::XsetupCleanup;
+    use super::build_sleep_config_content;
+    use super::decide_xsetup_cleanup;
+
+    // ---------- SDDM Xsetup 清理决策表 ----------
+
+    #[test]
+    fn xsetup_ftool_bak_with_ftool_current_removes_both() {
+        assert_eq!(
+            decide_xsetup_cleanup(true, true, true),
+            XsetupCleanup::RemoveXsetupAndBak
+        );
+    }
+
+    #[test]
+    fn xsetup_ftool_bak_keeps_non_ftool_current() {
+        // 备份为 ftool 产物（原始备份已丢失）但当前 Xsetup 非 ftool：仅删备份，保留用户内容
+        assert_eq!(
+            decide_xsetup_cleanup(true, false, true),
+            XsetupCleanup::RemoveBakOnly
+        );
+        assert_eq!(
+            decide_xsetup_cleanup(false, false, true),
+            XsetupCleanup::RemoveBakOnly
+        );
+    }
+
+    #[test]
+    fn xsetup_original_bak_restores_ftool_or_missing_current() {
+        // 备份为原始内容：当前 Xsetup 为 ftool 生成（或被删除）时用备份恢复
+        assert_eq!(
+            decide_xsetup_cleanup(true, true, false),
+            XsetupCleanup::Restore
+        );
+        assert_eq!(
+            decide_xsetup_cleanup(false, false, false),
+            XsetupCleanup::Restore
+        );
+    }
+
+    #[test]
+    fn xsetup_original_bak_keeps_user_modified_current() {
+        // 备份为原始内容但当前 Xsetup 已被用户/包更新修改：不覆盖
+        assert_eq!(
+            decide_xsetup_cleanup(true, false, false),
+            XsetupCleanup::Keep
+        );
+    }
+
+    // ---------- 挂起配置内容合并 ----------
+
+    const S0IX_KEY: &str = "NVreg_EnableS0ixPowerManagement=1";
+    const S3_KEY: &str = "NVreg_PreserveVideoMemoryAllocations=1";
+    const S0IX_TEXT: &str = "options nvidia NVreg_EnableS0ixPowerManagement=1";
+    const S3_TEXT: &str = "options nvidia NVreg_PreserveVideoMemoryAllocations=1";
+    const HEADER: &str = "# Automatically generated by ftool";
+
+    #[test]
+    fn sleep_config_empty_file_gets_header_and_params() {
+        let out = build_sleep_config_content("", S0IX_TEXT, S0IX_KEY, S3_KEY).unwrap();
+        assert!(out.starts_with(&format!("{HEADER}\n")));
+        assert!(out.contains(S0IX_TEXT));
+    }
+
+    #[test]
+    fn sleep_config_already_current_returns_none() {
+        let current = format!("{HEADER}\n{S0IX_TEXT}\n");
+        assert_eq!(
+            build_sleep_config_content(&current, S0IX_TEXT, S0IX_KEY, S3_KEY),
+            None
+        );
+    }
+
+    #[test]
+    fn sleep_config_other_mode_residue_is_stripped() {
+        // 同一文件同时存在两种模式的参数（用户手写/旧版本遗留）：剔除另一模式残留
+        let existing = format!("{HEADER}\n{S3_TEXT}\n{S0IX_TEXT}\n");
+        let out = build_sleep_config_content(&existing, S0IX_TEXT, S0IX_KEY, S3_KEY).unwrap();
+        assert!(!out.contains(S3_TEXT));
+        assert!(out.contains(S0IX_KEY));
+        // key 已存在：不重复追加 sleep_text 参数行
+        assert_eq!(out.matches(S0IX_TEXT).count(), 1);
+    }
+
+    #[test]
+    fn sleep_config_key_in_comment_is_not_treated_as_configured() {
+        // key 文本只出现在注释行：不算已配置，仍需写入真实参数行
+        let existing = format!("{HEADER}\n# 相关参数见 {S0IX_KEY}\n");
+        let out = build_sleep_config_content(&existing, S0IX_TEXT, S0IX_KEY, S3_KEY).unwrap();
+        assert!(out.contains(S0IX_TEXT));
+    }
+
+    #[test]
+    fn sleep_config_header_not_duplicated() {
+        // 已有其它用户内容但缺参数行：补写参数，标记头只保留一个
+        let existing = format!("{HEADER}\noptions nvidia NVreg_UsePageAttributeTable=1\n");
+        let out = build_sleep_config_content(&existing, S0IX_TEXT, S0IX_KEY, S3_KEY).unwrap();
+        assert_eq!(out.matches(HEADER).count(), 1);
+        assert!(out.contains(S0IX_TEXT));
+        assert!(out.contains("NVreg_UsePageAttributeTable=1"));
+    }
+
+    #[test]
+    fn sleep_config_switching_mode_strips_previous_params() {
+        // 从 S0ix 切到 S3：existing 含 S0ix 参数行，应被剔除后写入 S3 参数
+        let existing = format!("{HEADER}\n{S0IX_TEXT}\n");
+        let out = build_sleep_config_content(&existing, S3_TEXT, S3_KEY, S0IX_KEY).unwrap();
+        assert!(!out.contains(S0IX_KEY));
+        assert!(out.contains(S3_TEXT));
     }
 }
