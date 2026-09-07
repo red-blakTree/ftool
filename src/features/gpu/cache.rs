@@ -71,7 +71,7 @@ impl GpuCache {
         let json = serde_json::to_string_pretty(data)
             .map_err(|e| FtoolError::Gpu(format!("序列化缓存失败: {}", e)))?;
         debug!("写入缓存; path={}", CACHE_FILE_PATH);
-        super::helper::create_file(CACHE_FILE_PATH, &json, false)
+        super::file_io::create_file(CACHE_FILE_PATH, &json, false)
     }
 
     /// 从 JSON 文件读取缓存数据，并校验版本号和字段合理性

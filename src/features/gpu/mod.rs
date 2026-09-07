@@ -1,13 +1,20 @@
 mod cache;
+mod cleanup;
 pub mod cli;
 mod constants;
 mod detector;
+mod display;
+mod file_io;
 mod generator;
-mod helper;
+mod initramfs;
+mod power;
+mod services;
+mod sleep_config;
+mod snapshot;
 
 use crate::core::FtoolError;
 use cache::CacheData;
-use helper::{create_file, create_file_bytes};
+use file_io::{create_file, create_file_bytes};
 use log::{info, warn};
 
 /// GPU 工作模式枚举
@@ -89,14 +96,14 @@ impl GpuController {
         }
 
         // 切换前保存配置快照，失败时自动回滚
-        let snapshot = helper::ConfigSnapshot::save(constants::SNAPSHOT_PATHS)?;
+        let snapshot = snapshot::ConfigSnapshot::save(constants::SNAPSHOT_PATHS)?;
 
         let result = Self::do_switch(&opts);
         if let Err(ref e) = result {
             warn!("切换失败，正在回滚配置: {}", e);
             snapshot.restore();
             // 回滚后也重建 initramfs，恢复之前的内核模块/initramfs 状态
-            if let Err(rebuild_err) = helper::rebuild_initramfs() {
+            if let Err(rebuild_err) = initramfs::rebuild_initramfs() {
                 warn!("回滚后重建 initramfs 失败: {}", rebuild_err);
             }
         }
@@ -106,7 +113,7 @@ impl GpuController {
     /// 执行实际的模式切换（内部使用）
     fn do_switch(opts: &SwitchOptions) -> Result<(), FtoolError> {
         info!("🚀 正在切换到 {} 模式...", opts.mode.as_str());
-        helper::cleanup()?;
+        cleanup::cleanup()?;
 
         // 从 Integrated 模式离开时，NVIDIA PCI 设备可能已被 udev 移除。
         // 清理掉移除规则后先做一次显式 rescan，便于后续重新检测和写缓存；
@@ -131,13 +138,13 @@ impl GpuController {
             GpuMode::Nvidia => "on",
             GpuMode::Integrated => "off",
         };
-        helper::set_prime_discrete(prime_mode)?;
+        display::set_prime_discrete(prime_mode)?;
 
         // 追加挂起电源管理配置（非 Integrated 模式下需要）
-        helper::append_sleep_config(opts.mode)?;
+        sleep_config::append_sleep_config(opts.mode)?;
 
         // 重建 initramfs
-        helper::rebuild_initramfs()?;
+        initramfs::rebuild_initramfs()?;
         info!("✅ 切换成功！请重启计算机以使更改生效。");
         Ok(())
     }
@@ -155,13 +162,13 @@ impl GpuController {
     /// 重置所有由 ftool 生成的 GPU 配置
     pub fn reset() -> Result<(), FtoolError> {
         info!("🔄 正在重置 GPU 配置...");
-        helper::cleanup()?;
+        cleanup::cleanup()?;
         // 禁用 NVIDIA 相关 systemd 服务（与 Integrated 模式策略一致），
         // 否则清理配置后会残留仍处于 enable 状态的 suspend/persistenced 服务，
         // 形成"服务启用但挂起参数已被删除"的不一致中间态
         Self::configure_gpu_services(false, false, false);
         cache::GpuCache::delete()?;
-        helper::rebuild_initramfs()?;
+        initramfs::rebuild_initramfs()?;
         info!("✅ 重置成功！请重启计算机以使更改生效。");
         Ok(())
     }
@@ -190,15 +197,15 @@ impl GpuController {
     /// 运行时电源控制（无需重启，立即生效）
     pub fn power(action: PowerAction) -> Result<(), FtoolError> {
         match action {
-            PowerAction::On => helper::runtime_power_on(),
-            PowerAction::Off => helper::runtime_power_off(),
-            PowerAction::Auto => helper::auto_power(),
+            PowerAction::On => power::runtime_power_on(),
+            PowerAction::Off => power::runtime_power_off(),
+            PowerAction::Auto => power::auto_power(),
         }
     }
 
     /// 查询运行时 NVIDIA GPU 电源状态
     pub fn query_power() -> bool {
-        helper::query_runtime_power()
+        power::query_runtime_power()
     }
 
     /// 根据硬件和驱动特性推荐默认 GPU 模式
@@ -294,13 +301,13 @@ impl GpuController {
     /// - Nvidia:      全部启用（persistenced=true,  fallback=true,  suspend=true）
     fn configure_gpu_services(persistenced: bool, fallback: bool, suspend: bool) {
         let mut errors: Vec<String> = Vec::new();
-        if let Err(e) = helper::toggle_service("nvidia-persistenced.service", persistenced) {
+        if let Err(e) = services::toggle_service("nvidia-persistenced.service", persistenced) {
             errors.push(format!("nvidia-persistenced: {}", e));
         }
-        if let Err(e) = helper::toggle_service("nvidia-fallback.service", fallback) {
+        if let Err(e) = services::toggle_service("nvidia-fallback.service", fallback) {
             errors.push(format!("nvidia-fallback: {}", e));
         }
-        if let Err(e) = helper::configure_nvidia_suspend_services(suspend) {
+        if let Err(e) = services::configure_nvidia_suspend_services(suspend) {
             errors.push(format!("suspend services: {}", e));
         }
         if !errors.is_empty() {
@@ -370,16 +377,15 @@ impl GpuController {
         Self::write_modeset_config(opts.use_nvidia_current)?;
 
         // 写入 X11 PrimaryGPU 配置（参考 system76-power 的 discrete 模式）
-        helper::write_xorg_nvidia_config()?;
+        display::write_xorg_nvidia_config()?;
 
         // 写入 NVIDIA 额外 Xorg 配置（ForceCompositionPipeline / Coolbits）
-        helper::write_xorg_nvidia_extra_config(opts)?;
-
+        display::write_xorg_nvidia_extra_config(opts)?;
         // Display Manager 适配：SDDM / LightDM 的 xrandr 桥接脚本
-        helper::write_dm_scripts()?;
+        display::write_dm_scripts()?;
 
         // 写入 NVIDIA 环境变量配置，确保应用使用 NVIDIA 渲染
-        helper::write_nvidia_env_config()?;
+        display::write_nvidia_env_config()?;
 
         Ok(())
     }
