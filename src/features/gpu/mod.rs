@@ -47,7 +47,6 @@ impl std::str::FromStr for GpuMode {
     }
 }
 
-
 /// NVIDIA 模式的专有配置选项
 #[derive(Debug, Clone, Default)]
 pub struct NvidiaOptions {
@@ -241,27 +240,18 @@ impl GpuController {
                 let without_domain = raw.split_once(':').map(|(_, r)| r).unwrap_or(&raw);
                 let parts: Vec<&str> = without_domain.split(':').collect();
                 if parts.len() != 2 {
-                    return Err(FtoolError::Gpu(format!(
-                        "PCI 设备 ID 格式异常: {}",
-                        raw
-                    )));
+                    return Err(FtoolError::Gpu(format!("PCI 设备 ID 格式异常: {}", raw)));
                 }
                 let dev_func: Vec<&str> = parts[1].split('.').collect();
                 if dev_func.len() != 2 {
-                    return Err(FtoolError::Gpu(format!(
-                        "PCI 设备 ID 格式异常: {}",
-                        raw
-                    )));
+                    return Err(FtoolError::Gpu(format!("PCI 设备 ID 格式异常: {}", raw)));
                 }
-                let bus = u32::from_str_radix(parts[0], 16).map_err(|_| {
-                    FtoolError::Gpu(format!("PCI Bus 解析失败: {}", raw))
-                })?;
-                let dev = u32::from_str_radix(dev_func[0], 16).map_err(|_| {
-                    FtoolError::Gpu(format!("PCI Dev 解析失败: {}", raw))
-                })?;
-                let func = u32::from_str_radix(dev_func[1], 16).map_err(|_| {
-                    FtoolError::Gpu(format!("PCI Func 解析失败: {}", raw))
-                })?;
+                let bus = u32::from_str_radix(parts[0], 16)
+                    .map_err(|_| FtoolError::Gpu(format!("PCI Bus 解析失败: {}", raw)))?;
+                let dev = u32::from_str_radix(dev_func[0], 16)
+                    .map_err(|_| FtoolError::Gpu(format!("PCI Dev 解析失败: {}", raw)))?;
+                let func = u32::from_str_radix(dev_func[1], 16)
+                    .map_err(|_| FtoolError::Gpu(format!("PCI Func 解析失败: {}", raw)))?;
                 let bus_str = format!("PCI:{}:{}:{}", bus, dev, func);
 
                 // GPU 在线时同时收集所有 NVIDIA 设备 ID（用于 PCIe 断电后恢复）。
@@ -284,9 +274,7 @@ impl GpuController {
             Err(_) => {
                 // Fallback: 尝试读取已有缓存
                 let data = cache::GpuCache::read().map_err(|_| {
-                    FtoolError::Gpu(
-                        "sysfs 未检测到 NVIDIA 显卡且无缓存数据，无法保存缓存。".into(),
-                    )
+                    FtoolError::Gpu("sysfs 未检测到 NVIDIA 显卡且无缓存数据，无法保存缓存。".into())
                 })?;
                 info!(
                     "sysfs 未检测到 NVIDIA，使用现有缓存中的 PCI 地址和设备 ID; bus={}",

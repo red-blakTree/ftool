@@ -117,9 +117,7 @@ impl GpuDetector {
         if !rescan_path.exists() {
             return Ok(());
         }
-        fs::write(rescan_path, "1").map_err(|e| {
-            FtoolError::Gpu(format!("PCI rescan 失败: {}", e))
-        })
+        fs::write(rescan_path, "1").map_err(|e| FtoolError::Gpu(format!("PCI rescan 失败: {}", e)))
     }
 
     /// 通过 sysfs 检测所有 GPU 设备，返回 (nvidia_gpus, amd_gpus, intel_gpus)
@@ -243,7 +241,10 @@ impl GpuDetector {
         };
         let chassis_type: u32 = chassis.trim().parse().unwrap_or(0);
         if chassis_type != 0 && NON_SWITCHABLE_CHASSIS_TYPES.contains(&chassis_type) {
-            debug!("检测到非笔记本机型 (chassis_type={})，不支持 GPU 切换", chassis_type);
+            debug!(
+                "检测到非笔记本机型 (chassis_type={})，不支持 GPU 切换",
+                chassis_type
+            );
             return Ok(false);
         }
 
@@ -266,12 +267,8 @@ impl GpuDetector {
                 info!("sysfs 未检测到 NVIDIA 但缓存有效，系统仍支持 GPU 切换");
                 return Ok(true);
             }
-            if Path::new(MODPROBE_GPU_PATH).exists()
-                && Path::new(UDEV_INTEGRATED_PATH).exists()
-            {
-                info!(
-                    "sysfs 未检测到 NVIDIA 但存在 Integrated 残留配置，系统仍支持 GPU 切换"
-                );
+            if Path::new(MODPROBE_GPU_PATH).exists() && Path::new(UDEV_INTEGRATED_PATH).exists() {
+                info!("sysfs 未检测到 NVIDIA 但存在 Integrated 残留配置，系统仍支持 GPU 切换");
                 return Ok(true);
             }
         }
@@ -300,102 +297,93 @@ impl GpuDetector {
         let prime_mode = Self::read_prime_mode();
         let is_integrated = Self::has_integrated_config();
 
-        Self::classify_mode(
-            nvidia_loaded,
-            &prime_mode,
-            is_integrated,
-        )
+        Self::classify_mode(nvidia_loaded, &prime_mode, is_integrated)
     }
 
-// ========== 模式分类辅助函数 ==========
+    // ========== 模式分类辅助函数 ==========
 
-/// 检查 /proc/modules 中是否加载了 NVIDIA 核心模块
-fn is_nvidia_module_loaded(modules: &str) -> bool {
-    modules.lines().any(|line| {
-        let name = line.split_whitespace().next().unwrap_or("");
-        matches!(
-            name,
-            "nvidia" | "nvidia_drm" | "nvidia_current" | "nvidia_current_drm"
-        )
-    })
-}
+    /// 检查 /proc/modules 中是否加载了 NVIDIA 核心模块
+    fn is_nvidia_module_loaded(modules: &str) -> bool {
+        modules.lines().any(|line| {
+            let name = line.split_whitespace().next().unwrap_or("");
+            matches!(
+                name,
+                "nvidia" | "nvidia_drm" | "nvidia_current" | "nvidia_current_drm"
+            )
+        })
+    }
 
-/// 读取 PRIME 离散模式标志文件内容
-///
-/// 文件缺失视为无标记（首次使用/尚未切换过，属正常状态）；
-/// 文件存在但内容不在 {on, on-demand, off} 白名单内时给出警告，
-/// 避免后续模式分类在静默状态下基于异常内容做出错误判断。
-fn read_prime_mode() -> String {
-    match fs::read_to_string(PRIME_DISCRETE_PATH) {
-        Ok(content) => {
-            let mode = content.trim().to_string();
-            if matches!(mode.as_str(), "on" | "on-demand" | "off") {
-                mode
-            } else {
-                warn!(
-                    "{} 内容异常 {:?}，已按无标记处理，模式分类可能不准确",
-                    PRIME_DISCRETE_PATH,
+    /// 读取 PRIME 离散模式标志文件内容
+    ///
+    /// 文件缺失视为无标记（首次使用/尚未切换过，属正常状态）；
+    /// 文件存在但内容不在 {on, on-demand, off} 白名单内时给出警告，
+    /// 避免后续模式分类在静默状态下基于异常内容做出错误判断。
+    fn read_prime_mode() -> String {
+        match fs::read_to_string(PRIME_DISCRETE_PATH) {
+            Ok(content) => {
+                let mode = content.trim().to_string();
+                if matches!(mode.as_str(), "on" | "on-demand" | "off") {
                     mode
-                );
-                String::new()
+                } else {
+                    warn!(
+                        "{} 内容异常 {:?}，已按无标记处理，模式分类可能不准确",
+                        PRIME_DISCRETE_PATH, mode
+                    );
+                    String::new()
+                }
             }
+            Err(_) => String::new(),
         }
-        Err(_) => String::new(),
-    }
-}
-
-/// 检查是否存在 Integrated 模式的 udev 配置
-fn has_integrated_config() -> bool {
-    Path::new(MODPROBE_GPU_PATH).exists() && Path::new(UDEV_INTEGRATED_PATH).exists()
-}
-
-/// 综合分类当前 GPU 模式（纯决策函数，不涉及 I/O，便于测试）
-///
-/// 决策优先级（按顺序）：
-/// 1. NVIDIA 模块未加载 → Integrated
-/// 2. prime-discrete 显式标记 "on" → Nvidia
-/// 3. prime-discrete="on-demand" → Hybrid
-/// 4. NVIDIA 已加载但无特征配置 → Nvidia（保守兜底）
-///
-/// 注意：MODESET_PATH 同时被 Hybrid/Nvidia 两种模式写入（mod.rs 中两者都会
-/// 生成 nvidia-drm modeset=1 配置），不能作为 Hybrid 的判定特征；prime 标记
-/// 缺失/异常时保守归为 Nvidia，确保 power-off 门禁不会在 NVIDIA 驱动显示
-/// 输出时被误判为 Hybrid 而放行。
-fn classify_mode(
-    nvidia_loaded: bool,
-    prime_mode: &str,
-    is_integrated: bool,
-) -> super::GpuMode {
-    // NVIDIA 模块未加载 → Integrated
-    // （无论 nouveau 是否加载、是否存在 Integrated 配置残留）
-    if !nvidia_loaded {
-        return super::GpuMode::Integrated;
     }
 
-    // 以下所有分支 nvidia_loaded 均为 true
+    /// 检查是否存在 Integrated 模式的 udev 配置
+    fn has_integrated_config() -> bool {
+        Path::new(MODPROBE_GPU_PATH).exists() && Path::new(UDEV_INTEGRATED_PATH).exists()
+    }
 
-    // 配置/运行时不一致告警
-    if is_integrated {
-        warn!(
-            "配置/运行时不匹配: 存在 Integrated 模式的 modprobe 黑名单配置 \
+    /// 综合分类当前 GPU 模式（纯决策函数，不涉及 I/O，便于测试）
+    ///
+    /// 决策优先级（按顺序）：
+    /// 1. NVIDIA 模块未加载 → Integrated
+    /// 2. prime-discrete 显式标记 "on" → Nvidia
+    /// 3. prime-discrete="on-demand" → Hybrid
+    /// 4. NVIDIA 已加载但无特征配置 → Nvidia（保守兜底）
+    ///
+    /// 注意：MODESET_PATH 同时被 Hybrid/Nvidia 两种模式写入（mod.rs 中两者都会
+    /// 生成 nvidia-drm modeset=1 配置），不能作为 Hybrid 的判定特征；prime 标记
+    /// 缺失/异常时保守归为 Nvidia，确保 power-off 门禁不会在 NVIDIA 驱动显示
+    /// 输出时被误判为 Hybrid 而放行。
+    fn classify_mode(nvidia_loaded: bool, prime_mode: &str, is_integrated: bool) -> super::GpuMode {
+        // NVIDIA 模块未加载 → Integrated
+        // （无论 nouveau 是否加载、是否存在 Integrated 配置残留）
+        if !nvidia_loaded {
+            return super::GpuMode::Integrated;
+        }
+
+        // 以下所有分支 nvidia_loaded 均为 true
+
+        // 配置/运行时不一致告警
+        if is_integrated {
+            warn!(
+                "配置/运行时不匹配: 存在 Integrated 模式的 modprobe 黑名单配置 \
              但 nvidia 内核模块已加载（可能由其他软件或手动操作加载）"
-        );
-    }
+            );
+        }
 
-    // prime-discrete 显式标记 "on" → Nvidia 模式
-    if prime_mode == "on" {
-        return super::GpuMode::Nvidia;
-    }
+        // prime-discrete 显式标记 "on" → Nvidia 模式
+        if prime_mode == "on" {
+            return super::GpuMode::Nvidia;
+        }
 
-    // prime-discrete="on-demand" → Hybrid 模式
-    // （MODESET_PATH 不能作为 Hybrid 特征：Nvidia 模式同样写入该文件）
-    if prime_mode == "on-demand" {
-        return super::GpuMode::Hybrid;
-    }
+        // prime-discrete="on-demand" → Hybrid 模式
+        // （MODESET_PATH 不能作为 Hybrid 特征：Nvidia 模式同样写入该文件）
+        if prime_mode == "on-demand" {
+            return super::GpuMode::Hybrid;
+        }
 
-    // NVIDIA 已加载但无特征配置 → Nvidia（保守兜底）
-    super::GpuMode::Nvidia
-}
+        // NVIDIA 已加载但无特征配置 → Nvidia（保守兜底）
+        super::GpuMode::Nvidia
+    }
 
     /// 获取 NVIDIA GPU 的原始 PCI 设备 ID（如 "0000:01:00.0"），用于运行时电源控制
     pub fn get_nvidia_raw_pci_id() -> Result<String, FtoolError> {
@@ -523,7 +511,10 @@ fn classify_mode(
             }
         }
 
-        let paths: Vec<String> = supported_gpus.iter().map(|p| p.display().to_string()).collect();
+        let paths: Vec<String> = supported_gpus
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
         Err(FtoolError::Gpu(format!(
             "在所有 supported-gpus.json ({}) 中均未找到设备 0x{:04x}",
             paths.join(", "),
@@ -598,12 +589,11 @@ fn classify_mode(
     }
     /// 获取所有 NVIDIA PCI 设备的 (vendor, device) 对（所有功能号，不限于显示控制器）
     /// 用于在 GPU 仍然在线时保存设备 ID 到缓存，供 PCIe 断电后恢复使用
-    pub fn get_all_nvidia_device_ids() -> Result<Vec<crate::features::gpu::cache::NvidiaDeviceId>, FtoolError> {
+    pub fn get_all_nvidia_device_ids()
+    -> Result<Vec<crate::features::gpu::cache::NvidiaDeviceId>, FtoolError> {
         let pci_path = Path::new("/sys/bus/pci/devices");
         if !pci_path.is_dir() {
-            return Err(FtoolError::Gpu(
-                "/sys/bus/pci/devices 不存在".into(),
-            ));
+            return Err(FtoolError::Gpu("/sys/bus/pci/devices 不存在".into()));
         }
         let entries = fs::read_dir(pci_path)
             .map_err(|e| FtoolError::Gpu(format!("读取 PCI 目录失败: {}", e)))?;
@@ -702,4 +692,3 @@ mod tests {
         assert_eq!(classify(true, "", true), GpuMode::Nvidia);
     }
 }
-

@@ -144,10 +144,7 @@ fn parse_u32_flag(args: &[OsString], i: usize, flag: &str) -> Result<(u32, usize
 }
 
 /// 解析显卡切换的高级选项参数
-fn parse_switch_options(
-    mode: &str,
-    args: &[OsString],
-) -> Result<SwitchOptions, FtoolError> {
+fn parse_switch_options(mode: &str, args: &[OsString]) -> Result<SwitchOptions, FtoolError> {
     let gpu_mode = mode.parse::<GpuMode>()?;
     let mut nv_opts = NvidiaOptions::default();
 
@@ -221,7 +218,9 @@ fn parse_switch_options(
 
     // --use-nvidia-current 在 integrated 模式下无意义（NVIDIA 模块已被黑名单）
     if gpu_mode == GpuMode::Integrated && nv_opts.use_nvidia_current {
-        warn!("--use-nvidia-current 在 integrated 模式下无效（NVIDIA 模块已被黑名单），将忽略该选项");
+        warn!(
+            "--use-nvidia-current 在 integrated 模式下无效（NVIDIA 模块已被黑名单），将忽略该选项"
+        );
     }
 
     Ok(SwitchOptions {

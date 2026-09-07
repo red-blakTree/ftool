@@ -25,7 +25,10 @@ impl KernelSigner {
         // 自动安装会触发联网与系统包变更：仅在交互终端经用户确认后执行，
         // 非终端场景（脚本/cron）直接给出手动安装指引
         if !Prompter::is_terminal()
-            || !Prompter::ask_yes("📦 未找到 sbsign 命令，是否自动安装 sbsigntools？ [y/N]: ", false)
+            || !Prompter::ask_yes(
+                "📦 未找到 sbsign 命令，是否自动安装 sbsigntools？ [y/N]: ",
+                false,
+            )
         {
             return Err(FtoolError::Sign(
                 "未找到 sbsign 命令，请先手动安装: sudo dnf install sbsigntools".into(),
@@ -145,7 +148,7 @@ impl KernelSigner {
                 return Err(FtoolError::Sign(format!(
                     "内核路径 {} 缺少父目录，无法创建临时文件",
                     real_path.display()
-                )))
+                )));
             }
         };
 
@@ -166,18 +169,8 @@ impl KernelSigner {
             .unwrap_or_default()
             .as_millis();
         let pid = std::process::id();
-        let tmp_str = format!(
-            "{}/.kernel_sign.tmp.{}-{}",
-            parent_dir.display(),
-            pid,
-            ts
-        );
-        let bak_str = format!(
-            "{}/.kernel_sign.bak.{}-{}",
-            parent_dir.display(),
-            pid,
-            ts
-        );
+        let tmp_str = format!("{}/.kernel_sign.tmp.{}-{}", parent_dir.display(), pid, ts);
+        let bak_str = format!("{}/.kernel_sign.bak.{}-{}", parent_dir.display(), pid, ts);
         let tmp = Path::new(&tmp_str);
         let bak = Path::new(&bak_str);
 

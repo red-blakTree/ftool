@@ -125,7 +125,8 @@ pub const XORG_CONF_NVIDIA_PATH: &str = "/etc/X11/xorg.conf.d/11-nvidia-discrete
 
 /// X11 PrimaryGPU 配置文件备用路径（某些发行版 xorg.conf.d 位于 /usr/share 下）
 /// 参考 system76-power 的 `get_xorg_conf_path` 实现。
-pub const XORG_CONF_NVIDIA_FALLBACK_PATH: &str = "/usr/share/X11/xorg.conf.d/11-nvidia-discrete.conf";
+pub const XORG_CONF_NVIDIA_FALLBACK_PATH: &str =
+    "/usr/share/X11/xorg.conf.d/11-nvidia-discrete.conf";
 
 /// Nvidia 离散模式 X11 PrimaryGPU 配置内容
 ///

@@ -27,7 +27,11 @@ impl CommandRunner {
     ///
     /// 适用于 nvidia-smi 等可能因驱动异常而永久阻塞的命令。
     /// 轮询间隔为 100ms，超时后会 kill 子进程避免残留。
-    pub fn run_with_timeout<I, S>(cmd: &str, args: I, timeout_secs: u64) -> Result<Output, FtoolError>
+    pub fn run_with_timeout<I, S>(
+        cmd: &str,
+        args: I,
+        timeout_secs: u64,
+    ) -> Result<Output, FtoolError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,

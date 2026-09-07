@@ -147,5 +147,3 @@ fn handle_hash_command(args: &[OsString]) -> Result<(), FtoolError> {
     println!("{} {}", hash, path.to_string_lossy());
     Ok(())
 }
-
-
