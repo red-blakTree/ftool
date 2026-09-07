@@ -120,6 +120,23 @@ impl GpuDetector {
         fs::write(rescan_path, "1").map_err(|e| FtoolError::Gpu(format!("PCI rescan 失败: {}", e)))
     }
 
+    /// 读取 sysfs 十六进制属性（class/vendor/device）并解析为 u32
+    ///
+    /// 单个属性读取失败/缺失时记录 debug 并返回 0，避免因个别 sysfs 属性
+    /// 缺失而中断整个检测流程。
+    fn read_sysfs_attr_u32(dev_path: &Path, attr: &str, dev_name: &str) -> u32 {
+        match fs::read_to_string(dev_path.join(attr)) {
+            Ok(s) => u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).unwrap_or(0),
+            Err(e) => {
+                debug!(
+                    "读取 sysfs 属性失败; device={}, attr={}, error={}",
+                    dev_name, attr, e
+                );
+                0
+            }
+        }
+    }
+
     /// 通过 sysfs 检测所有 GPU 设备，返回 (nvidia_gpus, amd_gpus, intel_gpus)
     ///
     /// 读取失败时仅记录 debug 日志并跳过该设备，避免因单个 sysfs 属性缺失而中断检测。
@@ -147,51 +164,14 @@ impl GpuDetector {
         for dev_name in &all_devices {
             let dev_path = pci_path.join(dev_name);
 
-            // 读取 class
-            let class_str = match fs::read_to_string(dev_path.join("class")) {
-                Ok(s) => s.trim().to_string(),
-                Err(e) => {
-                    debug!(
-                        "读取 sysfs 属性失败; device={}, attr=class, error={}",
-                        dev_name, e
-                    );
-                    String::new()
-                }
-            };
-            let class = u32::from_str_radix(class_str.trim_start_matches("0x"), 16).unwrap_or(0);
-
             // 只关注显示控制器（class 0x03xxxx）
+            let class = Self::read_sysfs_attr_u32(&dev_path, "class", dev_name);
             if class >> 16 != 0x03 {
                 continue;
             }
 
-            // 读取 vendor
-            let vendor_str = match fs::read_to_string(dev_path.join("vendor")) {
-                Ok(s) => s.trim().to_string(),
-                Err(e) => {
-                    debug!(
-                        "读取 sysfs 属性失败; device={}, attr=vendor, error={}",
-                        dev_name, e
-                    );
-                    String::new()
-                }
-            };
-            let vendor_id =
-                u16::from_str_radix(vendor_str.trim_start_matches("0x"), 16).unwrap_or(0);
-
-            // 读取 device
-            let device_str = match fs::read_to_string(dev_path.join("device")) {
-                Ok(s) => s.trim().to_string(),
-                Err(e) => {
-                    debug!(
-                        "读取 sysfs 属性失败; device={}, attr=device, error={}",
-                        dev_name, e
-                    );
-                    String::new()
-                }
-            };
-            let device_id =
-                u16::from_str_radix(device_str.trim_start_matches("0x"), 16).unwrap_or(0);
+            let vendor_id = Self::read_sysfs_attr_u32(&dev_path, "vendor", dev_name) as u16;
+            let device_id = Self::read_sysfs_attr_u32(&dev_path, "device", dev_name) as u16;
 
             let gpu = GpuInfo {
                 pci_id: dev_name.clone(),

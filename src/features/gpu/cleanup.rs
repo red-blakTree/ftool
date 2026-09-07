@@ -1,7 +1,7 @@
 //! 清理 ftool 生成的系统配置文件，并恢复/清理 SDDM Xsetup。
 //!
 //! 决策（哪些文件可删、Xsetup 如何恢复）由纯函数 `decide_xsetup_cleanup`
-//! 承担，本模块只负责 IO 执行。
+//! 承担，本模块只负责 IO 执行；`cleanup()` 仅为三步的编排。
 
 use super::file_io::write_file_atomic_mode;
 use crate::core::FtoolError;
@@ -49,10 +49,12 @@ fn decide_xsetup_cleanup(
     }
 }
 
-/// 清理所有由 ftool 生成的系统配置文件
-pub(super) fn cleanup() -> Result<(), FtoolError> {
-    info!("🧹 清理旧的配置文件...");
-    // ftool 自身生成的配置路径（仅 /etc/ 下的文件，文件名即所有权，直接删除）
+/// 删除 ftool 自有配置文件（/etc 下，文件名即所有权，直接删除）
+///
+/// 删除失败必须中止切换流程：例如残留的 integrated udev 移除规则会在
+/// 随后的 PCI rescan/重启中再次移除 NVIDIA 设备，造成"报告成功实际失败"；
+/// do_switch 的快照回滚机制会负责还原其余已被删除的配置。
+fn remove_owned_configs() -> Result<(), FtoolError> {
     let to_remove: &[&str] = &[
         MODPROBE_GPU_PATH,
         MODESET_PATH,
@@ -70,9 +72,6 @@ pub(super) fn cleanup() -> Result<(), FtoolError> {
 
     for path in to_remove {
         debug!("尝试删除文件; path={}", path);
-        // ftool 自有文件删除失败必须中止切换流程：例如残留的 integrated udev 移除
-        // 规则会在随后的 PCI rescan/重启中再次移除 NVIDIA 设备，造成"报告成功实际
-        // 失败"；do_switch 的快照回滚机制会负责还原其余已被删除的配置。
         if let Err(e) = fs::remove_file(path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
@@ -82,11 +81,15 @@ pub(super) fn cleanup() -> Result<(), FtoolError> {
             )));
         }
     }
+    Ok(())
+}
 
-    // 旧版兼容路径（用于清理升级前的遗留文件）：
-    // 这些文件名并非 ftool 专有，可能由用户手写或 nvidia-xconfig 等第三方工具生成，
-    // 因此仅当内容确认带 ftool 生成标记时才删除，防止误删用户自己的配置
-    // （切换成功的路径不会触发快照回滚，删除是不可逆的）。
+/// 删除旧版兼容遗留文件（升级前的旧路径，如 nvidia-xconfig 产物）
+///
+/// 这些文件名并非 ftool 专有，可能由用户手写或第三方工具生成，因此仅当
+/// 内容确认带 ftool 生成标记时才删除，防止误删用户自己的配置（切换成功的
+/// 路径不会触发快照回滚，删除是不可逆的）。删除失败仅记录 warn。
+fn remove_legacy_configs() {
     let legacy_paths: &[&str] = &[
         "/etc/X11/xorg.conf",
         "/usr/share/X11/xorg.conf.d/11-nvidia-discrete.conf",
@@ -124,9 +127,11 @@ pub(super) fn cleanup() -> Result<(), FtoolError> {
             }
         }
     }
+}
 
-    // 还原 SDDM Xsetup：恢复/清理动作由纯函数 decide_xsetup_cleanup 决策，
-    // 此处仅执行 IO（读取、按动作写入/删除/恢复）
+/// 恢复/清理 SDDM Xsetup：恢复/清理动作由纯函数 `decide_xsetup_cleanup`
+/// 决策，此处仅执行 IO（读取、按动作写入/删除/恢复）。
+fn restore_sddm_xsetup() -> Result<(), FtoolError> {
     match fs::read(SDDM_XSETUP_BAK_PATH) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // 无备份（旧版本可能未保留备份）：仅删除能确认由 ftool 生成的 Xsetup
@@ -195,8 +200,15 @@ pub(super) fn cleanup() -> Result<(), FtoolError> {
             }
         }
     }
-
     Ok(())
+}
+
+/// 清理所有由 ftool 生成的系统配置文件
+pub(super) fn cleanup() -> Result<(), FtoolError> {
+    info!("🧹 清理旧的配置文件...");
+    remove_owned_configs()?;
+    remove_legacy_configs();
+    restore_sddm_xsetup()
 }
 
 #[cfg(test)]
