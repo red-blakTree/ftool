@@ -212,6 +212,36 @@ impl KernelSigner {
             let _ = fs::remove_file(tmp);
             return Err(FtoolError::Sign(format!("备份原内核文件失败: {e}")));
         }
+        // 在替换前把签名产物权限设为原文件权限（sbsign 按 umask 创建，可能丢失
+        // 0600 等收紧权限）：rename 后新文件直接以目标权限可见，不存在"先 0644
+        // 落盘、再事后收窄"的瞬时放宽窗口；失败时回滚备份并中止
+        if let Err(e) = fs::set_permissions(tmp, fs::Permissions::from_mode(original_mode)) {
+            let _ = fs::remove_file(tmp);
+            let rollback = fs::rename(bak, &real_path);
+            return Err(FtoolError::Sign(format!(
+                "设置签名产物权限失败: {e}；{}",
+                if rollback.is_ok() {
+                    "已自动恢复原文件".to_string()
+                } else {
+                    format!("且恢复原文件失败，原文件保留在 {}", bak.display())
+                }
+            )));
+        }
+        // 权限元数据也需落盘后再 rename（首次 sync 发生在设置权限之前）
+        fs::File::open(tmp)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| {
+                let _ = fs::remove_file(tmp);
+                let rollback = fs::rename(bak, &real_path);
+                FtoolError::Sign(format!(
+                    "同步签名产物权限失败: {e}；{}",
+                    if rollback.is_ok() {
+                        "已自动恢复原文件".to_string()
+                    } else {
+                        format!("且恢复原文件失败，原文件保留在 {}", bak.display())
+                    }
+                ))
+            })?;
 
         // 临时文件和目标文件在同一分区，fs::rename 保证原子操作
         if let Err(e) = fs::rename(tmp, &real_path) {
@@ -224,16 +254,6 @@ impl KernelSigner {
                 } else {
                     format!("且恢复原文件失败，原文件保留在 {}", bak.display())
                 }
-            )));
-        }
-
-        // 恢复原文件权限（新文件由 sbsign 按 umask 创建，可能丢失 0600 等收紧权限）。
-        // 恢复失败必须报错而非仅告警：引导文件意外放宽权限是安全降级；
-        // 此时备份尚未删除，保留在 bak 供用户手动恢复
-        if let Err(e) = fs::set_permissions(&real_path, fs::Permissions::from_mode(original_mode)) {
-            return Err(FtoolError::Sign(format!(
-                "签名完成但恢复内核文件权限失败: {e}；原文件备份保留在 {}，请手动检查文件权限",
-                bak.display()
             )));
         }
 
