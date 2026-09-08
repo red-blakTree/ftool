@@ -149,6 +149,12 @@ impl GpuDetector {
             }
         }
     }
+    /// 解析 0x 前缀十六进制文本为 u16（来源可为 sysfs 属性文件——内容形如
+    /// "0x10de\n" 带尾随换行——或 supported-gpus.json 的 devid 字段；换行必须
+    /// 在去 "0x" 前缀之前 trim，否则 from_str_radix 必失败）
+    fn parse_hex_u16(raw: &str) -> Option<u16> {
+        u16::from_str_radix(raw.trim().trim_start_matches("0x"), 16).ok()
+    }
 
     /// 通过 sysfs 检测所有 GPU 设备，返回 (nvidia_gpus, amd_gpus, intel_gpus)
     ///
@@ -527,8 +533,7 @@ impl GpuDetector {
                 }
             };
             for dev in gpus.chips {
-                let did = dev.devid.trim_start_matches("0x").trim();
-                if let Ok(parsed) = u16::from_str_radix(did, 16)
+                if let Some(parsed) = Self::parse_hex_u16(&dev.devid)
                     && parsed == gpu.device_id
                 {
                     if Self::subsystem_matches(&dev, gpu) {
@@ -570,9 +575,8 @@ impl GpuDetector {
         if gpu.subdevice_id == 0 || gpu.subvendor_id == 0 {
             return false;
         }
-        let parse = |s: &str| u16::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
         matches!(
-            (parse(json_subdev), parse(json_subvend)),
+            (Self::parse_hex_u16(json_subdev), Self::parse_hex_u16(json_subvend)),
             (Some(d), Some(v)) if d == gpu.subdevice_id && v == gpu.subvendor_id
         )
     }
@@ -662,7 +666,7 @@ impl GpuDetector {
         let mut ids = Vec::new();
         for entry in entries.flatten() {
             let vendor = match fs::read_to_string(entry.path().join("vendor")) {
-                Ok(s) => u16::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0),
+                Ok(s) => Self::parse_hex_u16(&s).unwrap_or(0),
                 Err(e) => {
                     debug!(
                         "读取 PCI vendor 失败，跳过; path={}, error={}",
@@ -678,16 +682,16 @@ impl GpuDetector {
             // 显式处理读取/解析失败：瞬时错误静默吞掉会把 (0x10de, 0x0000)
             // 这类无效项写入缓存，供后续 PCIe 断电恢复逻辑使用时产生误匹配
             let device = match fs::read_to_string(entry.path().join("device")) {
-                Ok(s) => match u16::from_str_radix(s.trim_start_matches("0x"), 16) {
-                    Ok(d) if d != 0 => d,
-                    Ok(_) => {
+                Ok(s) => match Self::parse_hex_u16(&s) {
+                    Some(d) if d != 0 => d,
+                    Some(_) => {
                         warn!(
                             "NVIDIA 设备 ID 解析为 0，跳过无效项; path={}",
                             entry.path().display()
                         );
                         continue;
                     }
-                    Err(_) => {
+                    None => {
                         warn!(
                             "NVIDIA 设备 ID 解析失败，跳过; path={}, value={}",
                             entry.path().display(),
@@ -751,5 +755,16 @@ mod tests {
     fn classify_prime_missing_with_nvidia_falls_back_to_nvidia() {
         assert_eq!(classify(true, "", false), GpuMode::Nvidia);
         assert_eq!(classify(true, "", true), GpuMode::Nvidia);
+    }
+
+    /// sysfs 属性文件内容以换行结尾（如 "0x10de\n"），解析必须先 trim 换行再
+    /// 去 "0x" 前缀；曾因此处漏 trim 导致 vendor 恒解析失败、NVIDIA 设备收集
+    /// 结果恒为空（detect_all_gpus 走 read_sysfs_attr_u32 先 trim 故正常，
+    /// 两处不一致正是该 bug 的根源）
+    #[test]
+    fn parse_hex_u16_handles_sysfs_trailing_newline() {
+        assert_eq!(super::GpuDetector::parse_hex_u16("0x10de\n"), Some(0x10de));
+        assert_eq!(super::GpuDetector::parse_hex_u16("0x2d19"), Some(0x2d19));
+        assert_eq!(super::GpuDetector::parse_hex_u16("0xzz\n"), None);
     }
 }
