@@ -5,7 +5,7 @@ use crate::core::runner::CommandRunner;
 use log::warn;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 /// 内核签名私钥路径
@@ -95,6 +95,12 @@ impl KernelSigner {
     ) -> FtoolError {
         let _ = fs::remove_file(tmp); // 清理临时签名产物
         let rollback = fs::rename(bak, real_path);
+        // 回滚成功后同步父目录，确保"备份移回原路径"的目录项落盘（尽力而为）
+        if rollback.is_ok()
+            && let Some(parent) = real_path.parent()
+        {
+            Self::sync_dir(parent);
+        }
         FtoolError::Sign(format!(
             "{step}失败: {cause}；{}",
             if rollback.is_ok() {
@@ -103,6 +109,73 @@ impl KernelSigner {
                 format!("且恢复原文件失败，原文件保留在 {}", bak.display())
             }
         ))
+    }
+
+    /// 同步目录的目录项到磁盘（Linux 允许 fsync 目录；尽力而为，失败仅告警）。
+    ///
+    /// rename/remove 等目录项变更需目录 fsync 才能在断电/崩溃后持久可见，
+    /// 但目录 fsync 失败不应阻断签名主流程，故只记录告警、不返回错误。
+    fn sync_dir(dir: &Path) {
+        if let Err(e) = fs::File::open(dir).and_then(|d| d.sync_all()) {
+            warn!(
+                "同步目录到磁盘失败（尽力而为）: {}; path={}",
+                e,
+                dir.display()
+            );
+        }
+    }
+
+    /// 以 O_EXCL（create_new）独占创建签名临时输出文件的占位普通文件。
+    ///
+    /// tmp 文件名（pid-时间戳）可预测，sbsign 以 O_TRUNC 打开 --output 会跟随
+    /// 符号链接：root 在攻击者可写的目录上执行 -S 时，预置同名符号链接可诱导
+    /// 覆写任意文件（/boot 等 root 独占目录不受影响）。先独占创建占位文件可使
+    /// 预置的符号链接/文件直接撞 EEXIST 报错而非被跟随（参考 file_io.rs 的原子
+    /// 写做法：创建期权限收紧到 0600）。假定 sbsign 对已存在的 --output 以
+    /// O_TRUNC 正常覆写（主流签名工具行为）；真实环境无法运行 sbsign 验证时
+    /// 本路径保持自洽——若 sbsign 反而要求输出文件不存在，会以清晰的命令错误
+    /// 失败，不会静默产出错误产物。
+    fn create_tmp_placeholder(tmp: &Path) -> Result<(), FtoolError> {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        opts.mode(0o600);
+        match opts.open(tmp) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // 创建失败时 tmp 可能并非本进程创建（预置文件/链接），不擅自删除
+                Err(FtoolError::Sign(format!(
+                    "创建签名临时输出文件失败 {}: {}",
+                    tmp.display(),
+                    e
+                )))
+            }
+        }
+    }
+
+    /// 校验签名产物仍为普通文件（非符号链接），不是普通文件则清理并报错。
+    ///
+    /// 预创建只挡住"开始时"的预置链接；签名过程中若目录可写者把占位文件替换
+    /// 成符号链接，后续 fs::set_permissions 会跟随链接作用于其指向的目标。
+    /// rename 本身不跟随符号链接，此校验把竞态压到残留的极小窗口。
+    fn ensure_tmp_regular(tmp: &Path) -> Result<(), FtoolError> {
+        match fs::symlink_metadata(tmp) {
+            Ok(md) if md.file_type().is_file() => Ok(()),
+            Ok(_) => {
+                let _ = fs::remove_file(tmp);
+                Err(FtoolError::Sign(format!(
+                    "签名产物 {} 不是普通文件（疑似被符号链接替换），已中止",
+                    tmp.display()
+                )))
+            }
+            Err(e) => {
+                let _ = fs::remove_file(tmp);
+                Err(FtoolError::Sign(format!(
+                    "读取签名产物元数据失败 {}: {}",
+                    tmp.display(),
+                    e
+                )))
+            }
+        }
     }
 
     /// 对指定的内核文件执行签名
@@ -132,15 +205,20 @@ impl KernelSigner {
             return Ok(());
         }
 
-        // 覆盖引导文件是不可逆操作，终端交互下先请用户确认
-        // （非终端场景跳过确认，与 -U 升级命令的交互约定一致）
-        if !Prompter::confirm(
+        // 覆盖引导文件是不可逆操作，非交互终端（脚本/cron）直接中止：
+        // 既不静默放行、也不静默走"取消"——与 upgrader 的 confirm_upgrade
+        // 行为对齐，危险操作必须由人工在终端确认
+        if !Prompter::is_terminal() {
+            return Err(FtoolError::Sign(
+                "stdin 不是交互终端，已中止签名（覆盖引导文件必须人工在终端确认）".into(),
+            ));
+        }
+        if !Prompter::ask_yes(
             &format!(
                 "即将覆盖签名内核文件: {}\n是否继续？ [y/N]: ",
                 real_path.display()
             ),
             false,
-            NonTerminal::Allow,
         ) {
             println!("已取消签名。");
             return Ok(());
@@ -177,6 +255,8 @@ impl KernelSigner {
         let bak_str = format!("{}/.kernel_sign.bak.{}-{}", parent_dir.display(), pid, ts);
         let tmp = Path::new(&tmp_str);
         let bak = Path::new(&bak_str);
+        // 防符号链接竞态（见 create_tmp_placeholder）：sbsign 前先独占创建占位文件
+        Self::create_tmp_placeholder(tmp)?;
 
         println!("正在签名: {}", real_path.display());
 
@@ -196,7 +276,8 @@ impl KernelSigner {
             let _ = fs::remove_file(tmp); // 清理残留临时文件
             return Err(FtoolError::Sign(format!("签名执行失败: {e}")));
         }
-
+        // 防符号链接竞态第二道校验：签名完成后确认 tmp 仍是普通文件再继续提交
+        Self::ensure_tmp_regular(tmp)?;
         // 替换前校验签名产物，避免把损坏/无效的产物覆盖到引导文件上
         if !Self::sbverify_passes(tmp).inspect_err(|_| {
             let _ = fs::remove_file(tmp);
@@ -215,11 +296,19 @@ impl KernelSigner {
                 FtoolError::Sign(format!("同步临时文件到磁盘失败: {e}"))
             })?;
 
+        // —— 提交阶段 ——
+        // 崩溃一致性说明：rename(real→bak) 与 rename(tmp→real) 之间仍存在极小
+        // 窗口（断电时盘上仅剩备份、real 缺失）。未使用 renameat2(RENAME_EXCHANGE)
+        // 原子互换：std 未封装、需直接 syscall，暂不引入——属已知取舍；本文件通过
+        // 两处目录 fsync 把"原文件丢失"的主要风险压到最小
         // 原文件先原子移为备份；后续任一步失败都能从备份回滚
         if let Err(e) = fs::rename(&real_path, bak) {
             let _ = fs::remove_file(tmp);
             return Err(FtoolError::Sign(format!("备份原内核文件失败: {e}")));
         }
+        // "原文件已移为备份"的目录项立即落盘：若此后断电/崩溃，备份文件在目录
+        // 重启后依然可见，可据此找回原文件
+        Self::sync_dir(parent_dir);
         // 在替换前把签名产物权限设为原文件权限（sbsign 按 umask 创建，可能丢失
         // 0600 等收紧权限）：rename 后新文件直接以目标权限可见，不存在"先 0644
         // 落盘、再事后收窄"的瞬时放宽窗口；失败时回滚备份并中止
@@ -242,7 +331,7 @@ impl KernelSigner {
             return Err(Self::commit_failed(tmp, bak, &real_path, "替换内核文件", e));
         }
 
-        // 签名成功：清理备份，并同步父目录保证目录项落盘
+        // 签名成功：清理备份，并同步父目录，保证"替换"与"清理备份"的目录项落盘
         if let Err(e) = fs::remove_file(bak) {
             warn!(
                 "清理内核备份文件失败（可手动删除）: {}; path={}",
@@ -250,9 +339,7 @@ impl KernelSigner {
                 bak.display()
             );
         }
-        if let Ok(dir) = fs::File::open(parent_dir) {
-            let _ = dir.sync_all();
-        }
+        Self::sync_dir(parent_dir);
 
         println!("签名完成: {}", real_path.display());
         Ok(())
@@ -339,6 +426,98 @@ mod tests {
             other => panic!("期望 Sign 错误，实际: {other:?}"),
         }
 
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    // ---------- 临时输出占位文件：符号链接竞态缓解 ----------
+
+    /// WHY: tmp 文件名可预测，sbsign 会跟随 --output 上的符号链接——
+    /// create_new 预创建必须让预置符号链接撞 EEXIST 报错，而不是跟随它覆写目标
+    #[test]
+    fn create_tmp_placeholder_rejects_preset_symlink() {
+        let dir =
+            std::env::temp_dir().join(format!("ftool-sign-placeholder-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let tmp = dir.join(".kernel_sign.tmp.preset");
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+
+        let err = KernelSigner::create_tmp_placeholder(&tmp).unwrap_err();
+
+        match err {
+            FtoolError::Sign(msg) => {
+                assert!(msg.contains("创建签名临时输出文件失败"), "{msg}");
+                assert!(
+                    msg.contains(&tmp.display().to_string()),
+                    "错误应包含 tmp 路径: {msg}"
+                );
+            }
+            other => panic!("期望 Sign 错误，实际: {other:?}"),
+        }
+        // 预置符号链接未被删除，指向的目标未被触碰
+        assert!(
+            std::fs::symlink_metadata(&tmp)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&victim);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// 占位文件创建成功时应是权限 0600 的普通空文件（创建期权限收紧）
+    #[test]
+    fn create_tmp_placeholder_creates_private_regular_file() {
+        let dir = std::env::temp_dir().join(format!("ftool-sign-tmpfile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join(".kernel_sign.tmp.fresh");
+
+        KernelSigner::create_tmp_placeholder(&tmp).unwrap();
+
+        let md = std::fs::metadata(&tmp).unwrap();
+        assert!(md.is_file(), "占位文件应为普通文件");
+        assert_eq!(md.len(), 0, "占位文件应为空文件（内容由 sbsign 写入）");
+        assert_eq!(
+            md.permissions().mode() & 0o777,
+            0o600,
+            "创建期权限应收紧到 0600"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// WHY: 签名成功后若占位文件被替换为符号链接，后续 set_permissions 会跟随
+    /// 链接作用于其指向的目标——提交前必须复核 tmp 仍是普通文件
+    #[test]
+    fn ensure_tmp_regular_rejects_symlink_and_missing() {
+        let dir = std::env::temp_dir().join(format!("ftool-sign-regular-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"x").unwrap();
+        let tmp = dir.join(".kernel_sign.tmp");
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+
+        match KernelSigner::ensure_tmp_regular(&tmp) {
+            Err(FtoolError::Sign(msg)) => assert!(msg.contains("不是普通文件"), "{msg}"),
+            other => panic!("期望 Sign 错误，实际: {other:?}"),
+        }
+        // 链接应被清理，且目标文件未被修改
+        assert!(!tmp.exists(), "符号链接应被清理");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "x");
+
+        // 普通文件应放行；不存在的路径应报错
+        std::fs::remove_file(&victim).unwrap();
+        let ok = dir.join(".kernel_sign.tmp.ok");
+        std::fs::write(&ok, b"signed").unwrap();
+        assert!(KernelSigner::ensure_tmp_regular(&ok).is_ok());
+        assert!(KernelSigner::ensure_tmp_regular(&dir.join(".kernel_sign.tmp.missing")).is_err());
+
+        let _ = std::fs::remove_file(&ok);
         let _ = std::fs::remove_dir(&dir);
     }
 }

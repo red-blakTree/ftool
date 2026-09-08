@@ -69,6 +69,7 @@ impl CommandRunner {
 
         let mut status: Option<ExitStatus> = None;
         let mut timed_out = false;
+        let mut wait_error: Option<std::io::Error> = None;
         loop {
             match child.try_wait() {
                 Ok(Some(s)) => {
@@ -84,10 +85,13 @@ impl CommandRunner {
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 Err(e) => {
-                    // 尽力终止并回收子进程，避免残留
+                    // try_wait 失败（极罕见，如 waitpid 被信号打断）：尽力终止并
+                    // 回收子进程，记下错误退出循环——直接 return 会跳过下方两个
+                    // 读管道线程的 join，使排空输出的线程脱离管理
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(FtoolError::Io(e));
+                    wait_error = Some(e);
+                    break;
                 }
             }
         }
@@ -97,14 +101,46 @@ impl CommandRunner {
         let stdout = stdout_thread.join().unwrap_or_default();
         let stderr = stderr_thread.join().unwrap_or_default();
 
+        // try_wait 失败分支：子进程已在循环内 kill + wait 回收，两个读管道线程
+        // 也已 join 完毕，此时才返回错误
+        if let Some(e) = wait_error {
+            return Err(FtoolError::Io(e));
+        }
+
         if timed_out {
+            // 超时错误附上已捕获输出的 stderr 尾部（复用 run_checked 的截断思路，
+            // 上限 512 字符），便于定位卡住原因；此时 join 已完成，内容完整
+            const MAX_ERR_LEN: usize = 512;
+            let stderr_text = String::from_utf8_lossy(&stderr).trim().to_string();
+            let detail = if stderr_text.is_empty() {
+                String::new()
+            } else {
+                // 超时原因通常在输出末尾，故保留尾部；超长时按 UTF-8 字符边界截断
+                let tail = if stderr_text.len() <= MAX_ERR_LEN {
+                    stderr_text
+                } else {
+                    let mut start = stderr_text.len() - MAX_ERR_LEN;
+                    while !stderr_text.is_char_boundary(start) {
+                        start += 1;
+                    }
+                    format!("…{}", &stderr_text[start..])
+                };
+                format!("，stderr 末尾: {}", tail)
+            };
             return Err(FtoolError::Process(format!(
-                "命令 '{}' 执行超时 ({}s)，已终止",
-                cmd, timeout_secs
+                "命令 '{}' 执行超时 ({}s)，已终止{}",
+                cmd, timeout_secs, detail
             )));
         }
+
+        // 不变量：循环内已处理 try_wait 的 Ok(None)/Ok(Some)/Err 三分支——
+        // 超时与 try_wait 失败均在上方返回错误，能走到此处 status 必为 Some
+        let status = match status {
+            Some(s) => s,
+            None => unreachable!("子进程状态已获取"),
+        };
         Ok(Output {
-            status: status.expect("子进程状态已获取"),
+            status,
             stdout,
             stderr,
         })
@@ -186,5 +222,30 @@ impl CommandRunner {
             .map(|code| format!("命令执行失败，退出码: {code}"))
             .unwrap_or_else(|| "命令执行失败：被信号异常终止".to_string());
         Err(FtoolError::Process(msg))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------- run_with_timeout：超时错误携带已捕获输出 ----------
+
+    /// WHY: 超时错误此前只报告"已终止"、不携带任何已捕获输出，脚本无法判断
+    /// 命令是卡死还是输出异常；超时后应把 stderr 尾部内容附在错误消息里
+    /// （在 join 完成之后取数，保证 stderr 内容完整）
+    #[test]
+    fn run_with_timeout_attaches_stderr_tail_to_error() {
+        // 向 stderr 写远超 512 字符的诊断输出后挂起，等待被超时终止
+        let script = "n=0; while [ $n -lt 300 ]; do echo \"diag line $n 0123456789 0123456789 0123456789\" >&2; n=$((n+1)); done; echo FINAL-TAIL-MARKER >&2; while :; do :; done";
+        let err = CommandRunner::run_with_timeout("sh", ["-c", script], 1).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("执行超时"), "{msg}");
+        assert!(msg.contains("stderr 末尾"), "错误应附带 stderr 内容: {msg}");
+        assert!(
+            msg.contains("FINAL-TAIL-MARKER"),
+            "应保留 stderr 尾部内容: {msg}"
+        );
+        assert!(msg.contains("…"), "超过 512 字符时应截断并标注省略: {msg}");
     }
 }

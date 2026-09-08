@@ -18,6 +18,26 @@ pub fn handle(args: &[OsString]) -> Result<(), FtoolError> {
 
     let action = args[2].to_string_lossy();
 
+    // 无参数子命令不允许携带多余参数：与 power 子命令对多余参数显式报错的行为
+    // 对齐，避免 `ftool -g query extra` 这类笔误/脚本残留参数被静默忽略
+    if matches!(
+        action.as_ref(),
+        "query"
+            | "switchable"
+            | "cache-query"
+            | "default"
+            | "ext-display"
+            | "runtimepm"
+            | "reset"
+            | "cache-create"
+            | "cache-delete"
+    ) && args.len() > 3
+    {
+        return Err(FtoolError::Input(format!(
+            "多余参数: {action} 子命令不接受参数"
+        )));
+    }
+
     match action.as_ref() {
         "query" => handle_query(),
         "switchable" => handle_switchable(),
@@ -153,6 +173,11 @@ fn parse_switch_options(mode: &str, args: &[OsString]) -> Result<SwitchOptions, 
         let arg = args[i].to_string_lossy();
         match arg.as_ref() {
             "--coolbits" => {
+                // 同一选项只允许出现一次：重复指定多半是脚本笔误，静默后值覆盖
+                // 前值（旧行为）会让用户误以为生效的是第一个值
+                if nv_opts.coolbits.is_some() {
+                    return Err(FtoolError::Input("参数重复指定: --coolbits".into()));
+                }
                 let (val, next) = parse_u32_flag(args, i, "coolbits")?;
                 if val > 31 {
                     return Err(FtoolError::Input(format!(
@@ -164,6 +189,9 @@ fn parse_switch_options(mode: &str, args: &[OsString]) -> Result<SwitchOptions, 
                 i = next;
             }
             "--rtd3" => {
+                if nv_opts.rtd3.is_some() {
+                    return Err(FtoolError::Input("参数重复指定: --rtd3".into()));
+                }
                 let (val, next) = parse_u32_flag(args, i, "rtd3")?;
                 if val > 3 {
                     return Err(FtoolError::Input("RTD3 值必须在 0-3 之间".into()));
@@ -172,10 +200,18 @@ fn parse_switch_options(mode: &str, args: &[OsString]) -> Result<SwitchOptions, 
                 i = next;
             }
             "--use-nvidia-current" => {
+                if nv_opts.use_nvidia_current {
+                    return Err(FtoolError::Input(
+                        "参数重复指定: --use-nvidia-current".into(),
+                    ));
+                }
                 nv_opts.use_nvidia_current = true;
                 i += 1;
             }
             "--force-comp" => {
+                if nv_opts.force_comp {
+                    return Err(FtoolError::Input("参数重复指定: --force-comp".into()));
+                }
                 nv_opts.force_comp = true;
                 i += 1;
             }
@@ -227,4 +263,90 @@ fn parse_switch_options(mode: &str, args: &[OsString]) -> Result<SwitchOptions, 
         mode: gpu_mode,
         nvidia_opts: nv_opts,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 组装 handle() 风格参数列表
+    fn os_args(parts: &[&str]) -> Vec<OsString> {
+        parts.iter().map(OsString::from).collect()
+    }
+
+    /// 断言解析返回 Input 错误且消息包含指定片段
+    fn assert_parse_input_err(mode: &str, args: &[&str], expect: &str) {
+        let err = match parse_switch_options(mode, &os_args(args)) {
+            Err(e) => e,
+            Ok(_) => panic!("应返回错误: {}", args.join(" ")),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains(expect), "错误消息应包含 '{expect}': {msg}");
+    }
+
+    // ---------- parse_switch_options：重复 flag 显式报错 ----------
+
+    /// WHY: `--coolbits 5 --coolbits 12` 这类重复指定多半是脚本笔误；旧行为
+    /// 静默以后值覆盖前值，用户以为生效的是第一个值，笔误难以被察觉
+    #[test]
+    fn duplicate_coolbits_is_rejected() {
+        assert_parse_input_err(
+            "nvidia",
+            &["--coolbits", "5", "--coolbits", "12"],
+            "参数重复指定: --coolbits",
+        );
+    }
+
+    #[test]
+    fn duplicate_rtd3_is_rejected() {
+        assert_parse_input_err(
+            "hybrid",
+            &["--rtd3", "1", "--rtd3", "2"],
+            "参数重复指定: --rtd3",
+        );
+    }
+
+    /// WHY: 布尔开关重复指定同样属于参数错误（重复 --flag 说明调用方拼装出错）
+    #[test]
+    fn duplicate_boolean_flags_are_rejected() {
+        for flag in ["--use-nvidia-current", "--force-comp"] {
+            assert_parse_input_err("nvidia", &[flag, flag], &format!("参数重复指定: {flag}"));
+        }
+    }
+
+    /// 回归：单次指定各选项仍应解析成功，重复检查不应误伤合法调用
+    #[test]
+    fn single_occurrence_of_each_flag_still_parses() {
+        let opts = parse_switch_options("nvidia", &os_args(&["--coolbits", "12"])).unwrap();
+        assert_eq!(opts.nvidia_opts.coolbits, Some(12));
+        let opts = parse_switch_options("hybrid", &os_args(&["--rtd3", "2"])).unwrap();
+        assert_eq!(opts.nvidia_opts.rtd3, Some(2));
+    }
+
+    // ---------- 无参数子命令：多余参数显式报错 ----------
+
+    /// WHY: 无参数子命令此前静默忽略多余参数，会掩盖笔误或脚本残留参数；
+    /// power 子命令已对多余参数报错，此处把其余无参子命令的行为统一对齐
+    #[test]
+    fn no_arg_subcommands_reject_extra_args() {
+        for action in [
+            "query",
+            "switchable",
+            "cache-query",
+            "default",
+            "ext-display",
+            "runtimepm",
+            "reset",
+            "cache-create",
+            "cache-delete",
+        ] {
+            let args = os_args(&["ftool", "-g", action, "extra"]);
+            let err = match handle(&args) {
+                Err(e) => e,
+                Ok(_) => panic!("{action} 携带多余参数应报错"),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("多余参数") && msg.contains(action), "{msg}");
+        }
+    }
 }

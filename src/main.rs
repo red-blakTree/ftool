@@ -17,6 +17,7 @@ fn print_usage() {
   ftool -g <操作> [选项]         显卡模式切换与管理 (需要 root)
   ftool -H <算法> <文件>         计算文件哈希值
   ftool -H <算法> -s <字符串>   计算字符串哈希值 (算法: md5, sha1, sha256, sha512)
+  (md5/sha1 仅供兼容旧工具，校验用途推荐 sha256/sha512)
   ftool -h                       显示帮助
   ftool -V                       显示版本信息
 
@@ -61,6 +62,9 @@ fn main() {
 
     if let Err(e) = run(&args) {
         error!("❌ {e}");
+        // 设计取舍：用法错误与运行失败统一以退出码 1 退出（用户主动取消为 0）；
+        // 脚本如需区分失败类别，可在此扩展细分退出码
+        let _ = std::io::stdout().flush(); // exit 不冲刷 stdout，管道场景可能丢失输出
         std::process::exit(1);
     }
 }

@@ -60,9 +60,14 @@ impl Hasher {
         const BUF_SIZE: usize = 1024 * 1024; // 1MiB 缓冲区
         let mut buffer = vec![0u8; BUF_SIZE];
         loop {
-            let n = reader
-                .read(&mut buffer)
-                .map_err(|e| FtoolError::File(format!("读取文件失败: {}", e)))?;
+            let n = match reader.read(&mut buffer) {
+                // EINTR（信号中断）属可重试错误：继续下一轮读取。大文件的多次
+                // read 中被信号打断的概率不低，直接返回错误会让一次无害信号
+                // 中断整个哈希计算
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(FtoolError::File(format!("读取文件失败: {}", e))),
+                Ok(n) => n,
+            };
             if n == 0 {
                 break;
             }
@@ -76,8 +81,20 @@ impl Hasher {
             hex_bytes.push(HEX_CHARS[(byte >> 4) as usize]);
             hex_bytes.push(HEX_CHARS[(byte & 0x0f) as usize]);
         }
-        Ok(String::from_utf8(hex_bytes).unwrap())
+        // 不变量：hex_bytes 仅由 HEX_CHARS 的 ASCII 十六进制字符组成，
+        // UTF-8 转换不可能失败
+        Ok(String::from_utf8(hex_bytes).expect("hex 输出仅含 ASCII，UTF-8 转换不可能失败"))
     }
+}
+
+/// 判断算法名是否在受支持白名单内（大小写不敏感）
+///
+/// 白名单与 dispatch 的匹配规则一致；handle_command 在打开文件前先调用本函数
+/// 做用法校验，dispatch 内部仍保留自身的防御性校验
+fn is_supported_algo(algo: &str) -> bool {
+    ["md5", "sha1", "sha256", "sha512"]
+        .iter()
+        .any(|a| a.eq_ignore_ascii_case(algo))
 }
 
 /// 处理 `-H` 命令：解析算法与文件/字符串参数，计算并打印哈希
@@ -86,6 +103,14 @@ pub fn handle_command(args: &[OsString]) -> Result<(), FtoolError> {
         return Err(FtoolError::Input("-H 参数需要指定算法".into()));
     }
     let algo = args[2].to_string_lossy();
+
+    // 算法白名单校验前置（在打开文件之前）：若先打开文件再校验算法，
+    // -H 拼错算法且文件路径不存在时会报误导性的"无法打开文件"，掩盖用法错误
+    if !is_supported_algo(&algo) {
+        return Err(FtoolError::Input(format!(
+            "不支持的哈希算法: {algo}，支持: md5, sha1, sha256, sha512"
+        )));
+    }
 
     if args.len() >= 4
         && let Some(flag) = args[3].to_str()
@@ -174,5 +199,68 @@ mod tests {
         let result = Hasher::hash::<Sha256>(&mut Cursor::new(data)).unwrap();
         // 不校验具体值，只确保不 panic
         assert_eq!(result.len(), 64);
+    }
+
+    // ---------- handle_command：算法白名单校验前置 ----------
+
+    /// WHY: 算法校验必须先于文件打开——-H 拼错算法且文件路径不存在时，旧实现
+    /// 先报"无法打开文件"，掩盖了真正的用法错误
+    #[test]
+    fn handle_command_checks_algo_before_opening_file() {
+        let args: Vec<OsString> = ["ftool", "-H", "bogus-algo", "/nonexistent-ftool-hash-test"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let err = handle_command(&args).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("不支持的哈希算法: bogus-algo"), "{msg}");
+        assert!(
+            !msg.contains("无法打开文件"),
+            "不应被文件打开错误掩盖: {msg}"
+        );
+    }
+
+    /// 白名单匹配应大小写不敏感；白名单外算法一律拒绝
+    #[test]
+    fn is_supported_algo_whitelist_is_case_insensitive() {
+        for algo in ["md5", "SHA1", "Sha256", "sha512"] {
+            assert!(is_supported_algo(algo), "{algo} 应在白名单内");
+        }
+        for algo in ["md4", "sha224", "sha", ""] {
+            assert!(!is_supported_algo(algo), "{algo} 不应在白名单内");
+        }
+    }
+
+    // ---------- EINTR 重试 ----------
+
+    /// 首次 read 返回 Interrupted、后续正常转发的读取器
+    struct InterruptOnce<R> {
+        inner: R,
+        interrupted: bool,
+    }
+
+    impl<R: Read> Read for InterruptOnce<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    /// WHY: read 被信号打断（EINTR）属可重试错误；若直接返回错误，一次无害的
+    /// 信号就足以让大文件多次 read 中的整个哈希计算失败
+    #[test]
+    fn interrupted_read_is_retried_instead_of_aborting() {
+        let mut reader = InterruptOnce {
+            inner: Cursor::new(b"hello"),
+            interrupted: false,
+        };
+        let result = Hasher::hash::<Sha256>(&mut reader).unwrap();
+        assert_eq!(
+            result,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
     }
 }
