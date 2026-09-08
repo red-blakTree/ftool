@@ -75,49 +75,79 @@ const OWNED_CONFIG_PATHS: &[&str] = &[
     NV_ENV_PATH,
     EXTRA_XORG_NVIDIA_PATH,
     XORG_CONF_NVIDIA_PATH,
+    // 备用路径：/etc/X11/xorg.conf.d 缺失的发行版上为活动写入路径（display.rs），
+    // 与主路径同样需要清理，避免切回 integrated 后 PrimaryGPU 配置残留
+    XORG_CONF_NVIDIA_FALLBACK_PATH,
     LIGHTDM_SCRIPT_PATH,
     LIGHTDM_CONFIG_PATH,
     // 注意：/lib/udev/rules.d/ 下的文件由包管理器管理，不在此处删除
 ];
 
-/// 删除 ftool 自有配置文件（/etc 下）
+/// 删除前备份目录：保留每个被删文件的最近一次内容副本
 ///
-/// 文件名并非全部 ftool 专有（如 50-remove-nvidia.rules、80-nvidia-pm.rules、
-/// 11-nvidia-discrete.conf 可能与 NVIDIA 官方教程或 system76-power 等第三方
-/// 工具共用），无条件删除会误删用户自建配置；成功切换路径不触发快照回滚、
-/// 删除不可逆——因此与 remove_legacy_configs 的策略一致，删除前先读内容确认
-/// 带 ftool 生成标记。唯一例外是 /etc/prime-discrete：内容为 on/off/on-demand
-/// 纯模式标记（与 system76-power 的互操作约定，无法内嵌注释行），该路径文件
-/// 只可能由切换工具创建且每次切换末尾都会按新目标重写，故仍无条件删除。
+/// 文件可能含用户手工追加的非 ftool 行（把 ftool 模板改造后自建、或在
+/// ftool 生成文件上补充自定义规则）。归属判定只能识别"是否含标记行"，
+/// 无法区分文件内哪些行属于 ftool——整删前留一份副本，用户可随时从备份
+/// 找回被清理的自定义内容，删除不再"静默且不可逆"。
+const CLEANUP_BACKUP_DIR: &str = "/var/cache/ftool/cleanup-backup";
+
+/// 删除前把待删文件内容备份到 [`CLEANUP_BACKUP_DIR`]（尽力而为，失败仅告警）
 ///
-/// 删除失败必须中止切换流程：例如残留的 integrated udev 移除规则会在
-/// 随后的 PCI rescan/重启中再次移除 NVIDIA 设备，造成"报告成功实际失败"；
-/// do_switch 的快照回滚机制会负责还原其余已被删除的配置。文件存在但无
-/// ftool 标记则保留并 warn 提示，不算失败、不中止。
-fn remove_owned_configs() -> Result<(), FtoolError> {
-    for path in OWNED_CONFIG_PATHS {
-        debug!("尝试删除文件; path={}", path);
-        if *path != PRIME_DISCRETE_PATH {
-            match fs::read(path) {
-                Ok(content) => {
-                    if !content_has_ftool_marker(&content) {
-                        // 文件存在但内容无 ftool 生成标记：可能为用户自建或第三方
-                        // 工具（system76-power）写入，保留并提示，不中止切换
-                        warn!("文件存在但无 ftool 标记，跳过删除; path={}", path);
-                        continue;
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // 文件不存在，无需处理
-                    continue;
-                }
-                Err(e) => {
-                    // 无法读取即无法确认归属，保守保留（与 remove_legacy_configs 一致）
-                    warn!("读取 {} 失败，跳过删除: {}", path, e);
-                    continue;
-                }
+/// 备份为原子写（同 file_io 原语），同名备份每次覆盖为最近一次内容；
+/// 备份失败不阻断清理——残留配置对模式切换的危害大于备份缺失，
+/// 但失败必须提示，否则用户无从得知备份缺失。
+fn backup_before_remove(path: &str) {
+    let Some(file_name) = Path::new(path).file_name() else {
+        return;
+    };
+    let backup_path = format!("{}/{}", CLEANUP_BACKUP_DIR, file_name.to_string_lossy());
+    match fs::read(path) {
+        Ok(content) => {
+            if let Err(e) = write_file_atomic_mode(&backup_path, &content, 0o600) {
+                warn!(
+                    "备份待删除文件失败（尽力而为）; path={}, backup={}, error={}",
+                    path, backup_path, e
+                );
+            } else {
+                debug!("已备份待删除文件; path={}, backup={}", path, backup_path);
             }
         }
+        // 文件在判定后被并发删除：与"本就不存在"等价，无需备份
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("读取待备份文件失败（尽力而为）; path={}, error={}", path, e),
+    }
+}
+
+/// 同步父目录的目录项到磁盘（尽力而为）
+///
+/// 与 file_io.rs 写侧（文件 + 目录双 fsync）对称：remove 的 unlink 不经
+/// 目录 fsync 可能在断电后未持久化，被删文件"复活"并与新模式配置叠加。
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent()
+        && let Err(e) = fs::File::open(parent).and_then(|dir| dir.sync_all())
+    {
+        warn!("同步父目录失败（非致命，删除已完成） {:?}: {}", parent, e);
+    }
+}
+
+/// 确认归属后删除单个配置文件；`Ok(true)` 已删除 / `Ok(false)` 未删除。
+///
+/// 归属判定（owned 与 legacy 统一使用行级标记匹配）：
+/// - 文件名并非全部 ftool 专有（如 50-remove-nvidia.rules、
+///   11-nvidia-discrete.conf 可能与 NVIDIA 官方教程或 system76-power 等
+///   第三方工具共用），无条件删除会误删用户自建配置；文件存在但无 ftool
+///   标记 → 保留并 warn，不算失败、不中止。
+/// - 唯一例外是 /etc/prime-discrete：内容为 on/off/on-demand 纯模式标记
+///   （与 system76-power 的互操作约定，无法内嵌注释行），该路径文件只可能
+///   由切换工具创建且每次切换末尾都会按新目标重写，故仍无条件删除。
+///
+/// 确认归属后删除前先备份原内容（见 [`backup_before_remove`]），随后删除并
+/// 同步父目录。`Err` 仅表示删除动作失败，必须中止流程：例如残留的
+/// integrated udev 移除规则会在随后的 PCI rescan/重启中再次移除 NVIDIA
+/// 设备，造成"报告成功实际失败"；do_switch 的快照回滚机制会负责还原其余
+/// 已被删除的配置。
+fn remove_config_if_ftool_owned(path: &str) -> Result<bool, FtoolError> {
+    if path == PRIME_DISCRETE_PATH {
         if let Err(e) = fs::remove_file(path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
@@ -126,6 +156,48 @@ fn remove_owned_configs() -> Result<(), FtoolError> {
                 path, e
             )));
         }
+        return Ok(true);
+    }
+
+    match fs::read(path) {
+        Ok(content) => {
+            if !content_has_ftool_marker(&content) {
+                warn!("文件存在但无 ftool 标记，跳过删除; path={}", path);
+                return Ok(false);
+            }
+            backup_before_remove(path);
+            if let Err(e) = fs::remove_file(path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(FtoolError::Gpu(format!(
+                    "删除配置文件失败; path={}, error={}",
+                    path, e
+                )));
+            }
+            sync_parent_dir(Path::new(path));
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // 文件不存在，无需处理
+            Ok(false)
+        }
+        Err(e) => {
+            // 无法读取即无法确认归属，保守保留
+            warn!("读取 {} 失败，跳过删除: {}", path, e);
+            Ok(false)
+        }
+    }
+}
+
+/// 删除 ftool 自有配置文件（/etc 下）
+///
+/// 删除失败必须中止切换流程：remove_config_if_ftool_owned 的 Err 仅表示
+/// "确认归属后的删除动作失败"（残留配置会与新模式冲突）；文件不存在或无
+/// ftool 标记返回 Ok(false) 不中止。
+fn remove_owned_configs() -> Result<(), FtoolError> {
+    for path in OWNED_CONFIG_PATHS {
+        debug!("尝试删除文件; path={}", path);
+        remove_config_if_ftool_owned(path)?;
     }
     Ok(())
 }
@@ -134,7 +206,6 @@ fn remove_owned_configs() -> Result<(), FtoolError> {
 /// 断言删除清单与 SNAPSHOT_PATHS 快照清单的覆盖关系）
 const LEGACY_CONFIG_PATHS: &[&str] = &[
     "/etc/X11/xorg.conf",
-    "/usr/share/X11/xorg.conf.d/11-nvidia-discrete.conf",
     "/etc/X11/xorg.conf.d/10-nvidia.conf",
     "/etc/X11/xorg.conf.d/90-nvidia.conf",
     "/etc/lightdm/nvidia.sh",
@@ -147,32 +218,13 @@ const LEGACY_CONFIG_PATHS: &[&str] = &[
 
 /// 删除旧版兼容遗留文件（升级前的旧路径，如 nvidia-xconfig 产物）
 ///
-/// 这些文件名并非 ftool 专有，可能由用户手写或第三方工具生成，因此仅当
-/// 内容确认带 ftool 生成标记时才删除，防止误删用户自己的配置（切换成功的
-/// 路径不会触发快照回滚，删除是不可逆的）。删除失败仅记录 warn。
+/// 与 owned 清单共用同一归属判定、备份与删除逻辑（行级标记匹配；不存在
+/// 或无 ftool 标记则保留）。区别仅在于：这些路径多为早期版本覆盖写入的
+/// 第三方/用户文件，删除失败只记录 warn、不中止流程。
 fn remove_legacy_configs() {
     for path in LEGACY_CONFIG_PATHS {
-        match fs::read_to_string(path) {
-            Ok(content) if content.starts_with(FTOOL_MARKER) => {
-                debug!("删除旧版 ftool 生成的遗留文件; path={}", path);
-                if let Err(e) = fs::remove_file(path)
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    warn!("无法删除文件; path={}, error={}", path, e);
-                }
-            }
-            Ok(_) => {
-                warn!(
-                    "跳过删除 {}: 文件存在但内容不含 ftool 生成标记，可能为用户自建配置",
-                    path
-                );
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // 文件不存在，无需处理
-            }
-            Err(e) => {
-                warn!("读取 {} 失败，跳过删除: {}", path, e);
-            }
+        if let Err(e) = remove_config_if_ftool_owned(path) {
+            warn!("无法删除文件; path={}, error={}", path, e);
         }
     }
 }
