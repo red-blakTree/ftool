@@ -44,7 +44,7 @@ impl Upgrader {
 
     /// 执行 Fedora 系统大版本升级（如 Fedora 40 → 41）
     ///
-    /// 流程编排：人工确认 → 可用性检测 → 可选更新当前系统 → 能力探测 →
+    /// 流程编排：人工确认 → 能力探测 → 可用性检测 → 可选更新当前系统 →
     /// 下载软件包 → 触发离线重启（或给出手动命令）。
     pub fn perform_upgrade() -> Result<(), FtoolError> {
         let cur = Self::fedora_version()?;
@@ -52,9 +52,12 @@ impl Upgrader {
         println!("\n⚠️ 即将进行系统升级: Fedora {cur} → {next}");
 
         Self::confirm_upgrade()?;
+        // 能力探测零副作用且无耗时，必须先于耗时/变更步骤执行：若系统不支持
+        // system-upgrade（缺插件），应尽早报错，避免用户在耗时的"更新当前
+        // 系统"（dnf upgrade --refresh）之后才被中止
+        Self::ensure_system_upgrade_supported()?;
         Self::ensure_release_available(next)?;
         Self::maybe_update_current()?;
-        Self::ensure_system_upgrade_supported()?;
         Self::download_packages(next)?;
         Self::reboot_or_hint()?;
         Ok(())
