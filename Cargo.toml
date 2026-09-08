@@ -1,6 +1,6 @@
 [package]
 name = "ftool"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "Fedora system utility for NVIDIA Optimus GPU switching"
 license = "GPL-3.0-or-later"
