@@ -128,14 +128,14 @@ impl GpuDetector {
     /// 缺失而中断整个检测流程。
     fn read_sysfs_attr_u32(dev_path: &Path, attr: &str, dev_name: &str) -> u32 {
         match fs::read_to_string(dev_path.join(attr)) {
-            Ok(s) => match u32::from_str_radix(s.trim().trim_start_matches("0x"), 16) {
-                Ok(v) => v,
-                Err(e) => {
+            Ok(s) => match Self::parse_hex_u32(&s) {
+                Some(v) => v,
+                None => {
                     // 内容存在但解析失败（非十六进制/超范围）：与 IO 失败同等对待，
                     // 记日志并返回 0，避免 0 值被静默当作合法 vendor/class 参与判断
                     debug!(
-                        "解析 sysfs 属性内容失败; device={}, attr={}, content={:?}, error={}",
-                        dev_name, attr, s, e
+                        "解析 sysfs 属性内容失败; device={}, attr={}, content={:?}",
+                        dev_name, attr, s
                     );
                     0
                 }
@@ -149,11 +149,23 @@ impl GpuDetector {
             }
         }
     }
-    /// 解析 0x 前缀十六进制文本为 u16（来源可为 sysfs 属性文件——内容形如
-    /// "0x10de\n" 带尾随换行——或 supported-gpus.json 的 devid 字段；换行必须
-    /// 在去 "0x" 前缀之前 trim，否则 from_str_radix 必失败）
+    /// 解析 0x/0X 前缀十六进制文本为 u32（来源可为 sysfs 属性文件——内容形如
+    /// "0x10de\n" 带尾随换行——或 supported-gpus.json 的字段；换行必须在去前缀
+    /// 之前 trim，否则 from_str_radix 必失败）
+    ///
+    /// 前缀只剥离一次（双重前缀如 "0x0x10de" 视为非法）；无前缀纯 hex 亦可解析。
+    fn parse_hex_u32(raw: &str) -> Option<u32> {
+        let trimmed = raw.trim();
+        let digits = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+        u32::from_str_radix(digits, 16).ok()
+    }
+
+    /// 解析十六进制文本为 u16；超出 u16 范围视为非法（返回 None）
     fn parse_hex_u16(raw: &str) -> Option<u16> {
-        u16::from_str_radix(raw.trim().trim_start_matches("0x"), 16).ok()
+        u16::try_from(Self::parse_hex_u32(raw)?).ok()
     }
 
     /// 通过 sysfs 检测所有 GPU 设备，返回 (nvidia_gpus, amd_gpus, intel_gpus)
@@ -666,7 +678,19 @@ impl GpuDetector {
         let mut ids = Vec::new();
         for entry in entries.flatten() {
             let vendor = match fs::read_to_string(entry.path().join("vendor")) {
-                Ok(s) => Self::parse_hex_u16(&s).unwrap_or(0),
+                Ok(s) => match Self::parse_hex_u16(&s) {
+                    Some(v) => v,
+                    None => {
+                        // 与 device 侧对称：解析失败记 warn 而非静默跳过（曾因漏
+                        // trim 换行导致 vendor 恒解析失败且全程无日志可查）
+                        warn!(
+                            "解析 PCI vendor 失败，跳过; path={}, value={}",
+                            entry.path().display(),
+                            s.trim()
+                        );
+                        continue;
+                    }
+                },
                 Err(e) => {
                     debug!(
                         "读取 PCI vendor 失败，跳过; path={}, error={}",
@@ -766,5 +790,19 @@ mod tests {
         assert_eq!(super::GpuDetector::parse_hex_u16("0x10de\n"), Some(0x10de));
         assert_eq!(super::GpuDetector::parse_hex_u16("0x2d19"), Some(0x2d19));
         assert_eq!(super::GpuDetector::parse_hex_u16("0xzz\n"), None);
+    }
+
+    /// 大写 0X 前缀、无前缀与尾随换行组合均可解析；双重前缀与超 u16 范围视为
+    /// 非法（device 收集侧跳过的依据）；u32 层完整保留 class 等 24 位值
+    #[test]
+    fn parse_hex_accepts_prefix_variants_and_rejects_overflow() {
+        assert_eq!(super::GpuDetector::parse_hex_u16("0X10DE\n"), Some(0x10de));
+        assert_eq!(super::GpuDetector::parse_hex_u16("10de\n"), Some(0x10de));
+        assert_eq!(super::GpuDetector::parse_hex_u16("0x1ffff"), None);
+        assert_eq!(super::GpuDetector::parse_hex_u16("0x0x10de"), None);
+        assert_eq!(
+            super::GpuDetector::parse_hex_u32("0x030000\n"),
+            Some(0x030000)
+        );
     }
 }

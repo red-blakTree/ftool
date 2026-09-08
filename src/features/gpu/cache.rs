@@ -7,7 +7,12 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 
-/// 当前缓存格式版本，变更不兼容格式时递增此值
+/// 当前缓存格式版本，读端（GpuCache::read）仅接受 version 等于此值的文件。
+///
+/// 变更写端格式时的取舍：递增版本会让本程序读端拒绝旧文件（需另行兼容），
+/// 不递增则旧版本程序读新文件会失败——v2 十进制数字 → "0x10de" 字符串属
+/// 后者（0.1.3 及更早回滚时缓存不可读）。缓存为派生数据，GPU 在线时下次
+/// 写入即自愈，故刻意保持 v2 并在读端兼容历史十进制形式。
 const CACHE_VERSION: u32 = 2;
 
 /// vendor/device 在 JSON 中以 "0x10de" 形式的十六进制字符串持久化（与 sysfs、
@@ -34,9 +39,13 @@ mod hex_u16 {
                 u16::try_from(v).map_err(|_| E::custom(format!("超出 u16 范围: {}", v)))
             }
 
-            // u16 语义不接受负值，明确报错而非泛化的类型错误
+            // 负值明确报错而非泛化的类型错误；非 JSON 格式可能以 i64 携带
+            // 正数（JSON 中非负整数走 visit_u64），此时仍应正常接受
             fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<u16, E> {
-                Err(E::custom(format!("设备 ID 不能为负: {}", v)))
+                if v < 0 {
+                    return Err(E::custom(format!("设备 ID 不能为负: {}", v)));
+                }
+                u16::try_from(v).map_err(|_| E::custom(format!("超出 u16 范围: {}", v)))
             }
 
             // 小数/指数形式不是合法设备 ID
@@ -273,5 +282,24 @@ mod tests {
         let float: Result<NvidiaDeviceId, _> =
             serde_json::from_str(r#"{"vendor":4318.5,"device":11545}"#);
         assert!(float.is_err());
+    }
+
+    /// 大写 0X 前缀与无前缀写法可解析；空串、孤立 "0x"、超 u16 范围及非字符串/
+    /// 数字类型明确报错
+    #[test]
+    fn device_id_hex_prefix_variants_and_invalid_inputs() {
+        let upper: NvidiaDeviceId =
+            serde_json::from_str(r#"{"vendor":"0X10DE","device":"2D19"}"#).unwrap();
+        assert_eq!((upper.vendor, upper.device), (0x10de, 0x2d19));
+
+        for json in [
+            r#"{"vendor":"","device":1}"#,
+            r#"{"vendor":"0x","device":1}"#,
+            r#"{"vendor":"0x110000","device":1}"#,
+            r#"{"vendor":true,"device":1}"#,
+        ] {
+            let result: Result<NvidiaDeviceId, _> = serde_json::from_str(json);
+            assert!(result.is_err(), "应拒绝: {}", json);
+        }
     }
 }
