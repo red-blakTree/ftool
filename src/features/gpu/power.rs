@@ -173,7 +173,7 @@ fn nvidia_functions_desc(pci_id: &str) -> Result<Vec<String>, FtoolError> {
 ///
 /// 记录已解绑设备与对应驱动，任一解绑失败时尝试重新绑定已解绑设备并
 /// 额外 PCI rescan 恢复，随后返回错误（已尝试恢复）。
-fn unbind_functions(functions: &[String]) -> Result<(), FtoolError> {
+fn unbind_functions(functions: &[String]) -> Result<Vec<(String, String)>, FtoolError> {
     let pci_path = Path::new("/sys/bus/pci/devices");
     let mut unbound: Vec<(String, String)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
@@ -202,15 +202,7 @@ fn unbind_functions(functions: &[String]) -> Result<(), FtoolError> {
     // 解绑阶段出错 → 尝试重新绑定已解绑设备 + PCI rescan 恢复
     if !errors.is_empty() {
         warn!("解绑过程出现错误，尝试恢复已解绑设备...");
-        let mut rebind_failures: Vec<String> = Vec::new();
-        for (func_id, driver_name) in unbound.iter().rev() {
-            let bind_path = format!("/sys/bus/pci/drivers/{}/bind", driver_name);
-            if let Err(e) = fs::write(&bind_path, func_id) {
-                let msg = format!("恢复绑定 {} 失败: {}", func_id, e);
-                warn!("{}", msg);
-                rebind_failures.push(msg);
-            }
-        }
+        let rebind_failures = rebind_unbound(&unbound);
         // 额外尝试 PCI rescan 恢复设备
         if let Err(e) = GpuDetector::rescan_pci_bus() {
             warn!("PCI rescan 恢复失败: {}", e);
@@ -226,13 +218,40 @@ fn unbind_functions(functions: &[String]) -> Result<(), FtoolError> {
             errors.join("; ")
         )));
     }
-    Ok(())
+    Ok(unbound)
+}
+
+/// 重新绑定之前解绑的设备（尽力而为），返回失败说明列表
+///
+/// 以与解绑相反的顺序（后解绑先绑定）重绑；已重新绑定驱动或已被移除的
+/// 设备自动跳过：驱动链接已存在 = 已绑定；设备目录消失 = 已被移除，
+/// 依赖调用方随后的 PCI rescan 重新枚举并自动绑定。
+fn rebind_unbound(unbound: &[(String, String)]) -> Vec<String> {
+    let pci_path = Path::new("/sys/bus/pci/devices");
+    let mut failures: Vec<String> = Vec::new();
+    for (func_id, driver_name) in unbound.iter().rev() {
+        if pci_path.join(func_id).join("driver").exists() {
+            debug!("设备已重新绑定驱动，跳过; func={}", func_id);
+            continue;
+        }
+        let bind_path = format!("/sys/bus/pci/drivers/{}/bind", driver_name);
+        if let Err(e) = fs::write(&bind_path, func_id) {
+            let msg = format!("恢复绑定 {} 失败: {}", func_id, e);
+            warn!("{}", msg);
+            failures.push(msg);
+        }
+    }
+    failures
 }
 
 /// 步骤 2：按功能号降序从 PCI 总线移除设备
 ///
-/// 任一步移除失败时尝试 PCI rescan 恢复设备，随后返回错误（已尝试恢复）。
-fn remove_functions(functions: &[String]) -> Result<(), FtoolError> {
+/// `unbound` 为步骤 1 成功解绑的 (设备, 驱动) 列表。任一步移除失败时，
+/// 先重新绑定仍停留在总线上的已解绑设备，再 PCI rescan 复活已被移除的
+/// 设备，随后返回错误（已尝试恢复）。仅 rescan 无法恢复"已解绑但移除
+/// 失败"的设备——设备仍在位却没有驱动，会停在无驱动半残态直到重启，
+/// 故移除阶段的恢复必须包含显式 rebind。
+fn remove_functions(functions: &[String], unbound: &[(String, String)]) -> Result<(), FtoolError> {
     let mut errors: Vec<String> = Vec::new();
 
     for func_id in functions {
@@ -247,14 +266,21 @@ fn remove_functions(functions: &[String]) -> Result<(), FtoolError> {
         }
     }
 
-    // 移除阶段出错 → 尝试 rescan 恢复设备
+    // 移除阶段出错 → 重新绑定残留设备 + rescan 恢复
     if !errors.is_empty() {
-        warn!("移除过程出现错误，尝试 rescan 恢复设备...");
+        warn!("移除过程出现错误，尝试恢复设备...");
+        let rebind_failures = rebind_unbound(unbound);
         if let Err(e) = GpuDetector::rescan_pci_bus() {
             warn!("PCI rescan 恢复失败: {}", e);
         }
+        if !rebind_failures.is_empty() {
+            log::error!(
+                "部分设备恢复失败！请手动检查 lspci 状态:\n{}",
+                rebind_failures.join("\n")
+            );
+        }
         return Err(FtoolError::Gpu(format!(
-            "移除阶段失败: {} (已尝试 PCI rescan 恢复)",
+            "移除阶段失败: {} (已尝试恢复绑定与 PCI rescan；若 GPU 仍不可用请重启系统)",
             errors.join("; ")
         )));
     }
@@ -302,11 +328,12 @@ pub(super) fn runtime_power_off() -> Result<(), FtoolError> {
     // unbind/remove 之间，新进程仍可能打开 /dev/nvidia* 使用 GPU——内核未提供
     // 用户态"检查并占用"的原子原语，双次扫描同样存在窗口。极端竞态下进程
     // 会在解绑/移除瞬间失败并返回 Err，不会静默报告成功。
-    // 步骤1：解绑所有 NVIDIA 设备的驱动（失败时自动恢复已解绑设备）
-    unbind_functions(&functions)?;
+    // 步骤1：解绑所有 NVIDIA 设备的驱动（失败时自动恢复已解绑设备）；
+    // 成功时返回已解绑列表，供步骤 2 移除失败时恢复绑定使用
+    let unbound = unbind_functions(&functions)?;
 
-    // 步骤2：从 PCI 总线移除设备（失败时自动 rescan 恢复）
-    remove_functions(&functions)?;
+    // 步骤2：从 PCI 总线移除设备（失败时自动恢复绑定 + rescan 恢复）
+    remove_functions(&functions, &unbound)?;
 
     Ok(())
 }

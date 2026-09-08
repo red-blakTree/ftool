@@ -17,13 +17,15 @@ pub(super) fn rebuild_initramfs() -> Result<(), FtoolError> {
         return CommandRunner::ensure_success(status);
     }
 
-    // Debian/Ubuntu 使用 update-initramfs
-    if Path::new("/usr/sbin/update-initramfs").exists()
-        || Path::new("/sbin/update-initramfs").exists()
-    {
-        info!("检测到 update-initramfs，使用 Debian 方式...");
-        let status = CommandRunner::run_status("update-initramfs", ["-u", "-k", "all"])?;
-        return CommandRunner::ensure_success(status);
+    // Debian/Ubuntu 使用 update-initramfs：探测的是绝对路径，执行也必须使用
+    // 同一绝对路径——受限 PATH（sudo secure_path/cron 等）下按命令名经 PATH
+    // 查找可能失败，报错与真实原因脱节
+    for update_initramfs in ["/usr/sbin/update-initramfs", "/sbin/update-initramfs"] {
+        if Path::new(update_initramfs).exists() {
+            info!("检测到 update-initramfs，使用 Debian 方式...");
+            let status = CommandRunner::run_status(update_initramfs, ["-u", "-k", "all"])?;
+            return CommandRunner::ensure_success(status);
+        }
     }
 
     // 其他发行版使用 dracut

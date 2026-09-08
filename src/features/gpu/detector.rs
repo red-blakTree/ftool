@@ -26,21 +26,23 @@ struct GpuInfo {
     pci_id: String,
     /// PCI 设备号，用于匹配 supported-gpus.json 中的 devid
     device_id: u16,
+    /// 子系统设备 ID（sysfs subsystem_device；0 = 读取失败/缺失）
+    subdevice_id: u16,
+    /// 子系统厂商 ID（sysfs subsystem_vendor；0 = 读取失败/缺失）
+    subvendor_id: u16,
 }
 
 /// NVIDIA GPU 设备条目（对应 supported-gpus.json 中的 chips 条目）
 ///
 /// 参考 system76-power 的实现，用于解析 NVIDIA 驱动附带的
 /// `/usr/share/doc/nvidia-driver-*/supported-gpus.json` 文件。
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct NvidiaDevice {
     /// 设备 ID（十六进制字符串，如 "0x1E90"）
     devid: String,
-    /// 子设备 ID
-    #[allow(dead_code)]
+    /// 子设备 ID（十六进制字符串，如 "0x1E91"）——与 sysfs subsystem_device 精确匹配
     subdeviceid: Option<String>,
-    /// 子厂商 ID
-    #[allow(dead_code)]
+    /// 子厂商 ID（十六进制字符串，如 "0x1462"）——与 sysfs subsystem_vendor 精确匹配
     subvendorid: Option<String>,
     /// 设备名称
     #[allow(dead_code)]
@@ -126,7 +128,18 @@ impl GpuDetector {
     /// 缺失而中断整个检测流程。
     fn read_sysfs_attr_u32(dev_path: &Path, attr: &str, dev_name: &str) -> u32 {
         match fs::read_to_string(dev_path.join(attr)) {
-            Ok(s) => u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).unwrap_or(0),
+            Ok(s) => match u32::from_str_radix(s.trim().trim_start_matches("0x"), 16) {
+                Ok(v) => v,
+                Err(e) => {
+                    // 内容存在但解析失败（非十六进制/超范围）：与 IO 失败同等对待，
+                    // 记日志并返回 0，避免 0 值被静默当作合法 vendor/class 参与判断
+                    debug!(
+                        "解析 sysfs 属性内容失败; device={}, attr={}, content={:?}, error={}",
+                        dev_name, attr, s, e
+                    );
+                    0
+                }
+            },
             Err(e) => {
                 debug!(
                     "读取 sysfs 属性失败; device={}, attr={}, error={}",
@@ -176,6 +189,12 @@ impl GpuDetector {
             let gpu = GpuInfo {
                 pci_id: dev_name.clone(),
                 device_id,
+                // 子系统 ID 用于 supported-gpus.json 的 SKU 级精确匹配；读取失败
+                // 时返回 0，匹配逻辑按"信息不足"回退到 devid 级
+                subdevice_id: Self::read_sysfs_attr_u32(&dev_path, "subsystem_device", dev_name)
+                    as u16,
+                subvendor_id: Self::read_sysfs_attr_u32(&dev_path, "subsystem_vendor", dev_name)
+                    as u16,
             };
 
             match vendor_id {
@@ -451,20 +470,20 @@ impl GpuDetector {
         // 总线顺序）取首个设备，避免多 NVIDIA 设备（内置 dGPU + eGPU）时误判
         let mut gpus = nvidia_gpus;
         gpus.sort_by(|a, b| a.pci_id.cmp(&b.pci_id));
-        let device_id = gpus[0].device_id;
-        let nvidia_dev = Self::get_nvidia_device(device_id)?;
+        let gpu = &gpus[0];
+        let nvidia_dev = Self::get_nvidia_device(gpu)?;
         info!(
-            "NVIDIA 设备 0x{:04x} 特性: {:?}",
-            device_id, nvidia_dev.features
+            "NVIDIA 设备 {} (0x{:04x}) 特性: {:?}",
+            gpu.pci_id, gpu.device_id, nvidia_dev.features
         );
         Ok(nvidia_dev.features.iter().any(|f| f == "runtimepm"))
     }
 
-    /// 从 supported-gpus.json 中查找指定设备 ID 对应的 NVIDIA GPU 条目
+    /// 从 supported-gpus.json 中查找指定 GPU 对应的 NVIDIA 设备条目
     ///
     /// 支持系统中存在多个支持的 JSON 文件版本（如旧版驱动残留），
     /// 遍历所有文件直至找到匹配的设备并返回其特性。
-    fn get_nvidia_device(id: u16) -> Result<NvidiaDevice, FtoolError> {
+    fn get_nvidia_device(gpu: &GpuInfo) -> Result<NvidiaDevice, FtoolError> {
         let supported_gpus: Vec<PathBuf> = fs::read_dir("/usr/share/doc")
             .map_err(|e| FtoolError::Gpu(format!("读取 /usr/share/doc 失败: {}", e)))?
             .filter_map(Result::ok)
@@ -486,6 +505,12 @@ impl GpuDetector {
             ));
         }
 
+        // 同一 devid 在 JSON 中常有多个条目（公版 + 各厂商 SKU，以 subdeviceid/
+        // subvendorid 区分），各条目 features 可能不同（直接影响 runtimepm 判断）：
+        // devid 命中后优先返回与 sysfs 实测子设备信息精确匹配的条目；
+        // 无精确条目时回退到首个 devid 命中（兼容 JSON 未携带子设备信息、
+        // 或 sysfs 读不到子系统 ID 的旧硬件/旧格式）
+        let mut fallback: Option<NvidiaDevice> = None;
         for json_path in &supported_gpus {
             let raw = match fs::read_to_string(json_path) {
                 Ok(s) => s,
@@ -504,11 +529,23 @@ impl GpuDetector {
             for dev in gpus.chips {
                 let did = dev.devid.trim_start_matches("0x").trim();
                 if let Ok(parsed) = u16::from_str_radix(did, 16)
-                    && parsed == id
+                    && parsed == gpu.device_id
                 {
-                    return Ok(dev);
+                    if Self::subsystem_matches(&dev, gpu) {
+                        info!(
+                            "supported-gpus.json 子设备精确匹配; pci={}, devid=0x{:04x}",
+                            gpu.pci_id, gpu.device_id
+                        );
+                        return Ok(dev);
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(dev);
+                    }
                 }
             }
+        }
+        if let Some(dev) = fallback {
+            return Ok(dev);
         }
 
         let paths: Vec<String> = supported_gpus
@@ -518,8 +555,26 @@ impl GpuDetector {
         Err(FtoolError::Gpu(format!(
             "在所有 supported-gpus.json ({}) 中均未找到设备 0x{:04x}",
             paths.join(", "),
-            id
+            gpu.device_id
         )))
+    }
+
+    /// 判断 JSON 条目的 subdeviceid/subvendorid 是否与 sysfs 实测值精确一致
+    ///
+    /// 条目缺任一子 ID、或 sysfs 侧读取失败（值为 0）时不构成精确匹配——
+    /// 信息不足时回退到 devid 级匹配，避免把错误 SKU 条目当作本机硬件。
+    fn subsystem_matches(dev: &NvidiaDevice, gpu: &GpuInfo) -> bool {
+        let (Some(json_subdev), Some(json_subvend)) = (&dev.subdeviceid, &dev.subvendorid) else {
+            return false;
+        };
+        if gpu.subdevice_id == 0 || gpu.subvendor_id == 0 {
+            return false;
+        }
+        let parse = |s: &str| u16::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+        matches!(
+            (parse(json_subdev), parse(json_subvend)),
+            (Some(d), Some(v)) if d == gpu.subdevice_id && v == gpu.subvendor_id
+        )
     }
 
     /// 获取 DMI 厂商字符串（如 "System76"、"LENOVO" 等）
