@@ -4,7 +4,7 @@
 //! 保证断电/崩溃窗口最小，权限在 rename 前一次到位，无"先放宽再收窄"窗口。
 
 use crate::core::FtoolError;
-use log::debug;
+use log::{debug, warn};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -21,8 +21,23 @@ pub(super) fn write_file_atomic_mode(
     content: &[u8],
     mode: u32,
 ) -> Result<(), FtoolError> {
+    // 防御性掩码：只保留权限位（含 setuid/setgid/sticky）。调用方（如快照
+    // 恢复）可能传入 metadata().mode()（携带文件类型位 0o100000 等高位），
+    // 高位不应透传给 chmod 语义
+    let mode = mode & 0o7777;
+
     if let Some(parent) = Path::new(path).parent() {
-        fs::create_dir_all(parent)
+        // create_dir_all 本身不指定 mode，会受 umask 影响（umask=000 时可能
+        // 建成 0777 目录）；DirBuilder 显式按 0755 创建（umask 只会收窄不会放宽）
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o755);
+        }
+        builder
+            .create(parent)
             .map_err(|e| FtoolError::Gpu(format!("创建目录失败 {:?}: {}", parent, e)))?;
     }
 
@@ -71,11 +86,15 @@ pub(super) fn write_file_atomic_mode(
         let _ = std::fs::remove_file(&tmp_path);
         FtoolError::Gpu(format!("重命名文件到 {} 失败: {}", path, e))
     })?;
-    // 同步父目录，确保 rename 的目录项落盘（Linux 允许 fsync 目录；尽力而为）
+    // 同步父目录，确保 rename 的目录项落盘（Linux 允许 fsync 目录；尽力而为）。
+    // 目录 fsync 失败只 warn 不返回 Err：rename 已完成，文件内容与权限均已落盘
     if let Some(parent) = Path::new(path).parent()
-        && let Ok(dir) = fs::File::open(parent)
+        && let Err(e) = fs::File::open(parent).and_then(|dir| dir.sync_all())
     {
-        let _ = dir.sync_all();
+        warn!(
+            "同步父目录失败（非致命，rename 已完成） {:?}: {}",
+            parent, e
+        );
     }
     debug!("配置文件已生效; path={}", path);
     Ok(())
@@ -105,7 +124,8 @@ mod tests {
     /// write_file_atomic_mode 落盘文件应带精确目标权限（无放宽窗口）
     #[test]
     fn atomic_write_mode_applies_exact_permissions() {
-        let dir = std::env::temp_dir().join(format!("ftool-atomic-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ftool-atomic-test-mode-{}", std::process::id()));
         let path = dir.join("conf");
         write_file_atomic_mode(path.to_str().unwrap(), b"# test\n", 0o600).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -124,7 +144,8 @@ mod tests {
     /// write_file_atomic 的 executable 语义映射 0755 / 0644
     #[test]
     fn atomic_write_executable_flag_maps_to_standard_modes() {
-        let dir = std::env::temp_dir().join(format!("ftool-atomic-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ftool-atomic-test-exec-{}", std::process::id()));
         let path = dir.join("script");
         write_file_atomic(path.to_str().unwrap(), b"#!/bin/sh\n", true).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -137,6 +158,21 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&path2);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// 传入了文件类型位等高位（如 metadata().mode() 的 0o100000）应被掩码剔除
+    #[test]
+    fn atomic_write_masks_non_permission_bits() {
+        // WHY：快照恢复等调用方传入的 mode 可能来自 metadata().permissions().mode()，
+        // 其中携带文件类型位；若不掩码，调试日志/语义上会把高位透传给 chmod
+        let dir =
+            std::env::temp_dir().join(format!("ftool-atomic-test-mask-{}", std::process::id()));
+        let path = dir.join("conf");
+        write_file_atomic_mode(path.to_str().unwrap(), b"x", 0o100640).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o640, "文件类型位应被掩码剔除，只应用 0640");
+        let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
     }
 }

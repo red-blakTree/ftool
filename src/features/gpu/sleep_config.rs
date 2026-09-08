@@ -11,6 +11,22 @@ use crate::features::gpu::detector::{GpuDetector, SleepMode};
 use log::{debug, warn};
 use std::fs;
 
+fn line_has_param_token(line: &str, key: &str) -> bool {
+    // modprobe.d options 行形如 "options <module> NVreg_xxx=y ..."，参数必然
+    // 独占一个空白分隔的 token；'#' 起头的分词是注释起点（整行注释或行内
+    // 注释），其后的内容不再视为参数区。整 token 精确比较可避免：
+    // 1) 注释里提到 key 被误判；2) 其它参数值含 key 子串（如 "...=10" 含 "=1"）被误判。
+    for token in line.split_whitespace() {
+        if token.starts_with('#') {
+            return false;
+        }
+        if token == key {
+            return true;
+        }
+    }
+    false
+}
+
 /// 计算挂起电源管理参数合并后的目标文件内容（纯函数，便于测试）。
 ///
 /// 返回 `Some(content)` 表示需要写入（目标内容与 `existing` 不同），`None`
@@ -24,16 +40,17 @@ fn build_sleep_config_content(
     key_line: &str,
     other_key: &str,
 ) -> Option<String> {
-    // 剔除另一挂起模式的参数行（S0ix/S3 参数不可并存）
+    // 剔除另一挂起模式的参数行（S0ix/S3 参数不可并存）。只剔除该 key 作为
+    // 独立参数 token 出现在非注释行中的行：注释里提到另一模式的 key 属于
+    // 说明文字，不应被当作残留参数行删除
     let lines: Vec<&str> = existing
         .lines()
-        .filter(|l| !l.contains(other_key))
+        .filter(|l| !line_has_param_token(l, other_key))
         .collect();
 
-    // 幂等判断只认非注释的参数行，避免注释等相似文本误判为已配置
-    let has_key = lines
-        .iter()
-        .any(|l| !l.trim_start().starts_with('#') && l.contains(key_line));
+    // 幂等判断同上：只认非注释行上的独立参数 token（形如 "NVreg_…=1"），
+    // key 文本混在注释或其它参数值中（如值 "=10" 含子串 "=1"）不会误判为已配置
+    let has_key = lines.iter().any(|l| line_has_param_token(l, key_line));
 
     let mut merged = String::new();
     if !has_key {
@@ -72,7 +89,11 @@ pub(super) fn append_sleep_config(mode: GpuMode) -> Result<(), FtoolError> {
         SleepMode::S0ix => MODPROBE_S0IX,
         SleepMode::S3 => MODPROBE_S3,
         SleepMode::Unknown => {
-            warn!("无法检测系统休眠模式，跳过挂起配置");
+            // 挂起参数缺失而切换仍报"成功"，必须让用户直接看到提示：
+            // 用 println! 输出面向用户的警告（log 属诊断输出，用户可能不关注）
+            println!(
+                "⚠️ 无法检测系统休眠模式（/sys/power/mem_sleep），未写入 NVIDIA 挂起参数；挂起/休眠后可能出现显示或显存问题"
+            );
             return Ok(());
         }
     };
@@ -92,8 +113,16 @@ pub(super) fn append_sleep_config(mode: GpuMode) -> Result<(), FtoolError> {
         SleepMode::Unknown => unreachable!("Unknown 已在前面返回"),
     };
 
-    // 读取现有内容（文件可能不存在）
-    let existing = fs::read_to_string(path).unwrap_or_default();
+    // 读取现有内容。文件不存在按空文件处理（正常首写）；存在但读取失败
+    // 说明文件不可读，warn 并跳过写入——避免用空内容覆盖可能含用户配置的文件
+    let existing = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            warn!("读取挂起配置文件失败，跳过写入 {}: {}", path, e);
+            return Ok(());
+        }
+    };
     let sleep_text = String::from_utf8_lossy(sleep_content);
     // 目标内容由纯函数计算（剔除另一挂起模式残留、补写参数、幂等判断），
     // 与磁盘当前内容不同才原子写入
@@ -174,5 +203,26 @@ mod tests {
         let out = build_sleep_config_content(&existing, S3_TEXT, S3_KEY, S0IX_KEY).unwrap();
         assert!(!out.contains(S0IX_KEY));
         assert!(out.contains(S3_TEXT));
+    }
+
+    #[test]
+    fn sleep_config_key_inside_other_param_value_is_not_configured() {
+        // WHY：幂等判断若用子串匹配，key 文本作为其它参数值的前缀出现
+        // （如值 =10 含子串 "=1"）会被误判为"已配置"而漏写参数；
+        // 只认空白分隔的独立参数 token 时，标准参数行仍需补写
+        let existing = format!("{HEADER}\noptions nvidia NVreg_EnableS0ixPowerManagement=10\n");
+        let out = build_sleep_config_content(&existing, S0IX_TEXT, S0IX_KEY, S3_KEY).unwrap();
+        assert!(out.contains(S0IX_TEXT));
+    }
+
+    #[test]
+    fn sleep_config_comment_mentioning_other_key_is_not_stripped() {
+        // WHY：剔除残留参数只针对非注释的 options 参数行；注释行提到另一
+        // 挂起模式的 key 属说明文字，子串剔除会把用户注释一并删掉
+        let comment = format!("# 曾使用 S3 参数 {S3_KEY} 的说明");
+        let existing = format!("{HEADER}\n{comment}\n");
+        let out = build_sleep_config_content(&existing, S0IX_TEXT, S0IX_KEY, S3_KEY).unwrap();
+        assert!(out.contains(&comment));
+        assert!(out.contains(S0IX_TEXT));
     }
 }

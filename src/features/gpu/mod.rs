@@ -15,7 +15,7 @@ mod snapshot;
 use crate::core::FtoolError;
 use cache::CacheData;
 use file_io::{create_file, create_file_bytes};
-use log::{info, warn};
+use log::{error, info, warn};
 
 /// GPU 工作模式枚举
 ///
@@ -88,6 +88,10 @@ impl GpuController {
 
     /// 切换 GPU 模式（需重启生效）
     pub fn switch_mode(opts: SwitchOptions) -> Result<(), FtoolError> {
+        // 进程级单实例锁：并发运行的两个 ftool 实例同时执行切换时，
+        // cleanup/快照/写入会交错执行导致系统配置损坏，必须互斥
+        let _lock = acquire_instance_lock()?;
+
         // 先检查系统是否支持 GPU 切换
         if !detector::GpuDetector::can_switch()? {
             return Err(FtoolError::Gpu(
@@ -101,7 +105,16 @@ impl GpuController {
         let result = Self::do_switch(&opts);
         if let Err(ref e) = result {
             warn!("切换失败，正在回滚配置: {}", e);
-            snapshot.restore();
+            // 回滚逐项尽力执行（单项失败不中止其余项），返回失败清单；
+            // 清单非空说明回滚不完整、系统处于中间态，必须向用户明确上报。
+            // 注意：这里仍返回原始切换错误，回滚细节通过 error! 逐条呈现
+            let rollback_failures = snapshot.restore();
+            if !rollback_failures.is_empty() {
+                error!("配置回滚不完整，以下项目恢复失败（请检查系统状态）:");
+                for issue in &rollback_failures {
+                    error!("  - {}", issue);
+                }
+            }
             // 回滚后也重建 initramfs，恢复之前的内核模块/initramfs 状态
             if let Err(rebuild_err) = initramfs::rebuild_initramfs() {
                 warn!("回滚后重建 initramfs 失败: {}", rebuild_err);
@@ -161,20 +174,30 @@ impl GpuController {
 
     /// 重置所有由 ftool 生成的 GPU 配置
     pub fn reset() -> Result<(), FtoolError> {
+        // 进程级单实例锁：与切换等变更命令互斥
+        let _lock = acquire_instance_lock()?;
+
         info!("🔄 正在重置 GPU 配置...");
         cleanup::cleanup()?;
         // 禁用 NVIDIA 相关 systemd 服务（与 Integrated 模式策略一致），
         // 否则清理配置后会残留仍处于 enable 状态的 suspend/persistenced 服务，
         // 形成"服务启用但挂起参数已被删除"的不一致中间态
-        Self::configure_gpu_services(false, false, false);
-        cache::GpuCache::delete()?;
-        initramfs::rebuild_initramfs()?;
+        let svc_issues = Self::configure_gpu_services(false, false, false);
+        // cleanup 与服务禁用均已不可逆：此后步骤若失败，系统已处于"半重置"
+        // 状态，返回的错误需附注说明，引导用户检查系统状态或手动重建 initramfs
+        cache::GpuCache::delete().map_err(with_reset_partial_state_note)?;
+        if let Err(e) = initramfs::rebuild_initramfs() {
+            return Err(with_reset_partial_state_note(e));
+        }
+        notify_service_config_issues(&svc_issues);
         info!("✅ 重置成功！请重启计算机以使更改生效。");
         Ok(())
     }
 
     /// 创建 NVIDIA GPU 缓存（需处于 hybrid 模式）
     pub fn cache_create() -> Result<(), FtoolError> {
+        // 进程级单实例锁：与切换等变更命令互斥
+        let _lock = acquire_instance_lock()?;
         let mode = detector::GpuDetector::query_current_mode();
         if mode != GpuMode::Hybrid {
             return Err(FtoolError::Input(
@@ -186,6 +209,8 @@ impl GpuController {
 
     /// 删除 GPU 缓存
     pub fn delete_cache() -> Result<(), FtoolError> {
+        // 进程级单实例锁：删除缓存与切换读写同一缓存文件，需互斥
+        let _lock = acquire_instance_lock()?;
         cache::GpuCache::delete()
     }
 
@@ -196,6 +221,8 @@ impl GpuController {
 
     /// 运行时电源控制（无需重启，立即生效）
     pub fn power(action: PowerAction) -> Result<(), FtoolError> {
+        // 进程级单实例锁：运行时电源控制同样变更系统状态，与切换等互斥
+        let _lock = acquire_instance_lock()?;
         match action {
             PowerAction::On => power::runtime_power_on(),
             PowerAction::Off => power::runtime_power_off(),
@@ -238,8 +265,10 @@ impl GpuController {
     ///
     /// 优先通过 sysfs 检测当前 NVIDIA GPU 的 PCI 地址并写入缓存。
     /// GPU 在线时同时收集所有 NVIDIA 设备 ID（用于 PCIe 断电后恢复）。
-    /// 如果 sysfs 中找不到（例如 Integrated 模式下 NVIDIA 已被 udev 移除），
-    /// 则回退读取已有缓存数据并重新写入以保持缓存新鲜。
+    /// 缓存数据只在 GPU 在线（sysfs 可检测到）时刷新；sysfs 检测不到
+    /// NVIDIA（例如 Integrated 模式下已被 udev 移除）时只读校验已有缓存
+    /// （版本与格式），不再重写——改写会刷新 mtime，把硬件已变化后的
+    /// 陈旧缓存持续"保鲜"，掩盖数据失效。
     fn write_nvidia_cache() -> Result<(), FtoolError> {
         let (pci_bus, device_ids) = match detector::GpuDetector::get_nvidia_raw_pci_id() {
             Ok(raw) => {
@@ -260,6 +289,15 @@ impl GpuController {
                 let func = u32::from_str_radix(dev_func[1], 16)
                     .map_err(|_| FtoolError::Gpu(format!("PCI Func 解析失败: {}", raw)))?;
                 let bus_str = format!("PCI:{}:{}:{}", bus, dev, func);
+                // 写入前做与读端（GpuCache::read）一致的格式/范围校验：hex→u32
+                // 解析可能产出越界值（如 bus>255 或带前导零），避免把非法地址
+                // 写入缓存；失败时带原始 sysfs 值报错便于排障
+                if !cache::GpuCache::validate_pci_bus(&bus_str) {
+                    return Err(FtoolError::Gpu(format!(
+                        "PCI 设备 ID 解析结果超出有效范围: {}",
+                        raw
+                    )));
+                }
 
                 // GPU 在线时同时收集所有 NVIDIA 设备 ID（用于 PCIe 断电后恢复）。
                 // rescan 后设备枚举是异步的，首次收集失败时短暂重试一次，
@@ -279,15 +317,32 @@ impl GpuController {
                 (bus_str, ids)
             }
             Err(_) => {
-                // Fallback: 尝试读取已有缓存
-                let data = cache::GpuCache::read().map_err(|_| {
-                    FtoolError::Gpu("sysfs 未检测到 NVIDIA 显卡且无缓存数据，无法保存缓存。".into())
-                })?;
+                // Fallback: sysfs 检测不到 NVIDIA（如 Integrated 模式下被 udev 移除）。
+                // 只读校验已有缓存（版本与格式）后直接返回——校验通过说明缓存
+                // 仍可用（作为后续模式切换的后备数据源），但不在 GPU 离线时
+                // 改写缓存，避免陈旧缓存被 mtime 持续"保鲜"
+                let data = match cache::GpuCache::read() {
+                    Ok(data) => data,
+                    // 从未写过缓存：无后备数据可用，报错合理
+                    Err(_) if !std::path::Path::new(constants::CACHE_FILE_PATH).exists() => {
+                        return Err(FtoolError::Gpu(
+                            "sysfs 未检测到 NVIDIA 显卡且无缓存数据，无法保存缓存。".into(),
+                        ));
+                    }
+                    // 缓存存在但损坏/版本不符：透出具体错误，便于区分
+                    // "从未缓存"与"缓存不可用"两种情形
+                    Err(e) => {
+                        return Err(FtoolError::Gpu(format!(
+                            "sysfs 未检测到 NVIDIA 显卡，且现有缓存不可用: {}",
+                            e
+                        )));
+                    }
+                };
                 info!(
-                    "sysfs 未检测到 NVIDIA，使用现有缓存中的 PCI 地址和设备 ID; bus={}",
+                    "sysfs 未检测到 NVIDIA，已有缓存校验通过（不重写，避免陈旧缓存被保鲜）; bus={}",
                     data.nvidia_gpu_pci_bus
                 );
-                (data.nvidia_gpu_pci_bus, data.nvidia_device_ids)
+                return Ok(());
             }
         };
         cache::GpuCache::write(&CacheData::new(pci_bus, device_ids))
@@ -299,20 +354,33 @@ impl GpuController {
     /// - Integrated:  全部禁用（persistenced=false, fallback=false, suspend=false）
     /// - Hybrid:      persistenced + suspend（persistenced=true,  fallback=false, suspend=true）
     /// - Nvidia:      全部启用（persistenced=true,  fallback=true,  suspend=true）
-    fn configure_gpu_services(persistenced: bool, fallback: bool, suspend: bool) {
-        let mut errors: Vec<String> = Vec::new();
-        if let Err(e) = services::toggle_service("nvidia-persistenced.service", persistenced) {
-            errors.push(format!("nvidia-persistenced: {}", e));
+    ///
+    /// 返回"未能按目标状态配置"的服务说明列表（空 = 全部配置成功），流程不中止。
+    /// 服务未安装（如 Fedora 无 nvidia-fallback.service）或 static/masked 等
+    /// 不可变更状态不算硬错误，仅记为"跳过"；只有真实 enable/disable 失败才
+    /// 记为错误。清单由各 switch_*/reset 在成功路径上以用户可见方式提示。
+    fn configure_gpu_services(persistenced: bool, fallback: bool, suspend: bool) -> Vec<String> {
+        let mut problems: Vec<String> = Vec::new();
+        for (service, enable) in [
+            ("nvidia-persistenced.service", persistenced),
+            ("nvidia-fallback.service", fallback),
+        ] {
+            match services::ensure_service_state(service, enable) {
+                Ok(services::ServiceConfigOutcome::Configured) => {}
+                Ok(services::ServiceConfigOutcome::Skipped) => {
+                    problems.push(services::service_config_issue_message(
+                        service, enable, None,
+                    ));
+                }
+                Err(e) => problems.push(services::service_config_issue_message(
+                    service,
+                    enable,
+                    Some(&e.to_string()),
+                )),
+            }
         }
-        if let Err(e) = services::toggle_service("nvidia-fallback.service", fallback) {
-            errors.push(format!("nvidia-fallback: {}", e));
-        }
-        if let Err(e) = services::configure_nvidia_suspend_services(suspend) {
-            errors.push(format!("suspend services: {}", e));
-        }
-        if !errors.is_empty() {
-            warn!("GPU 服务配置失败: {}", errors.join("; "));
-        }
+        problems.extend(services::configure_nvidia_suspend_services(suspend));
+        problems
     }
 
     /// Integrated 模式：完全禁用 NVIDIA 驱动，仅使用集成显卡
@@ -323,7 +391,7 @@ impl GpuController {
             warn!("保存 NVIDIA GPU 缓存失败，继续执行; error={}", e);
         }
 
-        Self::configure_gpu_services(false, false, false);
+        let svc_issues = Self::configure_gpu_services(false, false, false);
 
         // 写入 modprobe 黑名单（使用二进制写入避免编码问题）
         create_file_bytes(constants::MODPROBE_GPU_PATH, constants::MODPROBE_INTEGRATED)?;
@@ -338,15 +406,25 @@ impl GpuController {
         // 二次确认：cleanup() 已在 switch_mode 入口执行，此处为额外安全清理
         // 确保 modeset 配置文件不会在 Integrated 模式下残留
         if std::path::Path::new(constants::MODESET_PATH).exists() {
-            let _ = std::fs::remove_file(constants::MODESET_PATH);
+            match std::fs::remove_file(constants::MODESET_PATH) {
+                Ok(()) => {}
+                // 检查后被并发删除等竞态与"文件本就不存在"等价，忽略
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!(
+                    "删除 modeset 残留文件失败 {}: {}",
+                    constants::MODESET_PATH,
+                    e
+                ),
+            }
         }
 
+        notify_service_config_issues(&svc_issues);
         Ok(())
     }
 
     /// Hybrid 模式：PRIME 按需渲染，支持 RTD3 动态电源管理
     fn switch_hybrid(rtd3: Option<u32>, use_nvidia_current: bool) -> Result<(), FtoolError> {
-        Self::configure_gpu_services(true, false, true);
+        let svc_issues = Self::configure_gpu_services(true, false, true);
 
         // 写入空 modprobe 配置（允许所有驱动正常加载）
         create_file_bytes(constants::MODPROBE_GPU_PATH, constants::MODPROBE_EMPTY)?;
@@ -359,7 +437,10 @@ impl GpuController {
         // 写入 Hybrid 专用 udev 电源管理规则（移除 Audio/USB/UCSI 设备以节省电量）
         create_file(constants::UDEV_PM_PATH, constants::UDEV_PM_CONTENT, false)?;
 
-        Self::write_nvidia_cache()
+        Self::write_nvidia_cache()?;
+
+        notify_service_config_issues(&svc_issues);
+        Ok(())
     }
 
     /// Nvidia 模式：仅使用 NVIDIA 独立显卡输出画面
@@ -368,7 +449,7 @@ impl GpuController {
     /// 同时写入 nvidia-drm modeset=1 确保 Wayland 下的 DRM 直通输出，
     /// 并补充 ForceCompositionPipeline/Coolbits 等 Xorg 选项与 DM 桥接脚本。
     fn switch_nvidia(opts: &NvidiaOptions) -> Result<(), FtoolError> {
-        Self::configure_gpu_services(true, true, true);
+        let svc_issues = Self::configure_gpu_services(true, true, true);
 
         // 写入空 modprobe 配置
         create_file_bytes(constants::MODPROBE_GPU_PATH, constants::MODPROBE_EMPTY)?;
@@ -387,6 +468,7 @@ impl GpuController {
         // 写入 NVIDIA 环境变量配置，确保应用使用 NVIDIA 渲染
         display::write_nvidia_env_config()?;
 
+        notify_service_config_issues(&svc_issues);
         Ok(())
     }
 
@@ -401,4 +483,79 @@ impl GpuController {
         };
         create_file(constants::MODESET_PATH, content, false)
     }
+}
+
+/// 变更命令的进程级单实例锁文件路径（/run 优先；变更命令均需 root 运行）
+const INSTANCE_LOCK_PATH: &str = "/run/ftool.lock";
+
+/// 获取进程级单实例建议锁
+///
+/// 并发运行两个 ftool 实例执行变更命令会交错 cleanup/快照/写入，导致
+/// 系统配置损坏。返回：
+/// - `Ok(Some(file))`：持锁成功，file 需保持存活到命令结束（drop 关闭
+///   fd 时自动释放 flock）；
+/// - `Ok(None)`：建锁本身失败（如 /run 不存在/无权限），warn 后继续，
+///   尽力而为，避免锁机制问题阻断功能；
+/// - `Err`：锁已被其它实例占用（LOCK_NB 返回 EWOULDBLOCK），调用方应中止命令。
+#[cfg(unix)]
+fn acquire_instance_lock() -> Result<Option<std::fs::File>, FtoolError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        // 锁文件内容无意义（只使用 fd 上的 flock），打开时不截断不清空
+        .truncate(false)
+        .create(true)
+        .mode(0o600)
+        .open(INSTANCE_LOCK_PATH)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            warn!("无法打开单实例锁文件，继续执行（尽力而为）: {}", e);
+            return Ok(None);
+        }
+    };
+
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        // 锁已被占用是唯一需要中止命令的情形（明确提示用户稍后再试）
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Err(FtoolError::Gpu(
+                "另一个 ftool 实例正在运行，请稍后再试".into(),
+            ));
+        }
+        warn!("单实例加锁失败，继续执行（尽力而为）: {}", err);
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
+
+#[cfg(not(unix))]
+fn acquire_instance_lock() -> Result<Option<std::fs::File>, FtoolError> {
+    Ok(None)
+}
+
+/// 打印"服务未能按模式配置"的用户可见警告
+///
+/// 在成功路径上由各 switch_*/reset 调用：配置失败不阻断切换，但用户
+/// 必须知道哪些服务实际未按目标模式配置，故用 println!（面向用户）输出
+fn notify_service_config_issues(issues: &[String]) {
+    if issues.is_empty() {
+        return;
+    }
+    println!("⚠️ 注意：以下 NVIDIA 服务未能按模式配置（重启后相关功能可能不完整）:");
+    for issue in issues {
+        println!("  - {}", issue);
+    }
+}
+
+/// 为 reset 后半段（不可逆清理完成后）的失败错误附加"半重置状态"说明
+fn with_reset_partial_state_note(e: FtoolError) -> FtoolError {
+    FtoolError::Gpu(format!(
+        "{}（注意：配置与服务已清理，仅最后步骤失败；请检查系统状态后重试或手动重建 initramfs）",
+        e
+    ))
 }

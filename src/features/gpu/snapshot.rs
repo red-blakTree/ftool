@@ -4,7 +4,7 @@ use super::file_io::write_file_atomic_mode;
 use super::services::{service_is_enabled, toggle_service};
 use crate::core::FtoolError;
 use crate::features::gpu::constants::SERVICE_SNAPSHOT_NAMES;
-use log::{debug, info, warn};
+use log::{debug, info};
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -52,8 +52,12 @@ impl ConfigSnapshot {
     }
 
     /// 将配置恢复到快照状态：先恢复文件，再恢复服务
-    pub(super) fn restore(&self) {
+    ///
+    /// 逐项尽力恢复：单项失败不中止其余项的回滚（既有语义）。返回失败项
+    /// 说明列表（空 = 完全恢复成功），由调用方决定如何向用户上报。
+    pub(super) fn restore(&self) -> Vec<String> {
         info!("正在恢复配置快照...");
+        let mut failures: Vec<String> = Vec::new();
 
         for (path, file) in &self.files {
             match file {
@@ -65,14 +69,14 @@ impl ConfigSnapshot {
                         Ok(()) => {
                             debug!("已回滚文件: {}", path);
                         }
-                        Err(e) => warn!("回滚文件 {} 失败: {}", path, e),
+                        Err(e) => failures.push(format!("回滚文件 {} 失败: {}", path, e)),
                     }
                 }
                 None => {
                     if let Err(e) = fs::remove_file(path)
                         && e.kind() != std::io::ErrorKind::NotFound
                     {
-                        warn!("回滚时删除 {} 失败: {}", path, e);
+                        failures.push(format!("回滚时删除 {} 失败: {}", path, e));
                     }
                 }
             }
@@ -82,12 +86,12 @@ impl ConfigSnapshot {
             match prev_state {
                 Some(true) => {
                     if let Err(e) = toggle_service(svc, true) {
-                        warn!("回滚服务 {} (enable) 失败: {}", svc, e);
+                        failures.push(format!("回滚服务 {} (enable) 失败: {}", svc, e));
                     }
                 }
                 Some(false) => {
                     if let Err(e) = toggle_service(svc, false) {
-                        warn!("回滚服务 {} (disable) 失败: {}", svc, e);
+                        failures.push(format!("回滚服务 {} (disable) 失败: {}", svc, e));
                     }
                 }
                 None => {
@@ -96,6 +100,7 @@ impl ConfigSnapshot {
             }
         }
 
-        info!("配置快照恢复完成");
+        info!("配置快照恢复完成（失败 {} 项）", failures.len());
+        failures
     }
 }

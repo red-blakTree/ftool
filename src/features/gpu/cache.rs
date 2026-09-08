@@ -50,7 +50,10 @@ impl GpuCache {
     /// - BB (bus): 0–255
     /// - DD (device): 0–31
     /// - F  (function): 0–7
-    fn validate_pci_bus(bus: &str) -> bool {
+    ///
+    /// 读端（`read`）与写端（mod.rs 组装 "PCI:…" 字符串后）共用此校验，
+    /// 保证解析路径与校验路径对格式/范围的认知一致。
+    pub(super) fn validate_pci_bus(bus: &str) -> bool {
         let parts: Vec<&str> = bus.split(':').collect();
         if parts.len() != 4 || parts[0] != "PCI" {
             return false;
