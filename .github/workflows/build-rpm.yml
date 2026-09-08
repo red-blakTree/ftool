@@ -4,15 +4,20 @@ on:
   push:
     branches:
       - main
-    tags:
-      - "v*"
   workflow_dispatch:
 
-# main 分支的滚动 Release 每次 push 都会删除重建，并发 push 会产生竞态
-# （两个 job 同时 delete/create latest），取消旧的在途构建只保留最新
+# 发布策略：
+# - 每次 main push 读取 Cargo.toml 版本号，与已发布的正式 Release 比对：
+#   * 版本号变化（如 0.1.2 → 0.1.3，尚无 v0.1.3 正式 Release）→ 创建正式发行
+#   * 版本号未变化（vX.Y.Z 已正式发布过）→ 创建独立命名的预发行
+#     vX.Y.Z-dev.<run_number>，每次构建一个全新条目，绝不修改既有发行
+# - 同 ref 的并发 push 会取消旧的在途构建，只保留最新
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  GH_TOKEN: ${{ github.token }}
 
 jobs:
   build-rpm:
@@ -49,28 +54,50 @@ jobs:
           path: target/generate-rpm/*.rpm
           if-no-files-found: error
 
-      # 正式发布：打 v* tag 时创建对应版本的 GitHub Release
-      - name: Publish GitHub Release (tag)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: target/generate-rpm/*.rpm
-          generate_release_notes: true
-
-      # 滚动发布：push 到 main 时删除旧 Release 并用 gh 重建，
-      # 使固定 tag "latest" 始终指向最新构建，RPM 附件每次覆盖
-      - name: Publish rolling Release (main)
-        if: github.ref == 'refs/heads/main'
-        env:
-          GH_TOKEN: ${{ github.token }}
+      # 判定本次构建的发行类型与 tag（只读远程，无副作用）
+      - name: Resolve release kind
+        id: kind
         run: |
-          set -e
-          gh release delete latest --yes --cleanup-tag >/dev/null 2>&1 || true
-          gh release create latest \
-            --title "ftool 最新构建 (${{ github.sha }})" \
-            --notes "main 分支自动构建于 commit ${{ github.sha }}（$(date -u +%Y-%m-%dT%H:%MZ)）。
-            
+          set -euo pipefail
+          VERSION=$(awk '/^\[package\]/{f=1} f && /^version *=/{gsub(/[" ,]/, "", $3); print $3; exit}' Cargo.toml)
+          TAG="v${VERSION}"
+          if gh release view "${TAG}" --json tagName >/dev/null 2>&1; then
+            # 版本号未变化：该版本已有正式发行 → 预发行，tag 带构建号保证每次唯一
+            KIND="prerelease"
+            TAG="${TAG}-dev.${GITHUB_RUN_NUMBER}"
+          else
+            # 版本号变化：尚无该版本的正式发行 → 正式发行
+            KIND="release"
+          fi
+          echo "kind=${KIND}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "检测到 Cargo.toml 版本 ${VERSION} → 发行类型: ${KIND} (tag: ${TAG})"
+
+      - name: Publish GitHub Release
+        run: |
+          set -euo pipefail
+          KIND="${{ steps.kind.outputs.kind }}"
+          TAG="${{ steps.kind.outputs.tag }}"
+          VERSION="${{ steps.kind.outputs.version }}"
+          if [ "${KIND}" = "release" ]; then
+            gh release create "${TAG}" \
+              --target "${{ github.sha }}" \
+              --title "ftool v${VERSION}" \
+              --notes "正式发行 v${VERSION}（Cargo.toml 版本号变更触发）。
+
             下载 RPM 后安装：
             sudo dnf install ./ftool-*.rpm" \
-            --target "${{ github.sha }}" \
-            target/generate-rpm/*.rpm
+              target/generate-rpm/*.rpm
+          else
+            gh release create "${TAG}" \
+              --prerelease \
+              --target "${{ github.sha }}" \
+              --title "ftool v${VERSION} 预发行 #${{ github.run_number }}" \
+              --notes "预发行构建（v${VERSION} 已正式发布，本次为版本号未变化的持续构建，commit ${{ github.sha }}）。
+
+            每次构建生成独立条目，不修改已存在的任何发行。
+            下载 RPM 后安装：
+            sudo dnf install ./ftool-*.rpm" \
+              target/generate-rpm/*.rpm
+          fi
