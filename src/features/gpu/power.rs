@@ -70,7 +70,7 @@ fn has_nvidia_processes() -> Result<bool, FtoolError> {
 
         // nvidia-persistenced 常驻持有 /dev/nvidiactl，不代表运行中的工作负载
         let comm = fs::read_to_string(proc_dir.join(&pid).join("comm")).unwrap_or_default();
-        if comm.trim() == "nvidia-persistenced" {
+        if is_persistenced_comm(&comm) {
             continue;
         }
 
@@ -89,6 +89,19 @@ fn has_nvidia_processes() -> Result<bool, FtoolError> {
         }
     }
     Ok(false)
+}
+
+/// 判断进程 comm 是否为 nvidia-persistenced（常驻守护进程）
+///
+/// Linux 内核 TASK_COMM_LEN=16（含结尾 NUL），/proc/<pid>/comm 最多只能读出
+/// 15 个字符：完整名 "nvidia-persistenced"（19 字符）会被截断为
+/// "nvidia-persiste"。两个形态都判为命中——完整名保证语义完整（测试可直接
+/// 使用），截断名对应 /proc 的真实读出值；此前只按完整名比较在真实系统上
+/// 恒为 false，导致 persistenced 常驻持有 /dev/nvidiactl 被计入"运行中的
+/// 进程"，Hybrid 模式下 runtime_power_off / auto_power 必然误报存在运行进程。
+fn is_persistenced_comm(comm: &str) -> bool {
+    let comm = comm.trim();
+    comm == "nvidia-persiste" || comm == "nvidia-persistenced"
 }
 
 /// 判断文件描述符目标是否为 NVIDIA GPU 设备节点
@@ -285,6 +298,10 @@ pub(super) fn runtime_power_off() -> Result<(), FtoolError> {
     // 按功能号降序收集同 slot 的 NVIDIA function（子设备在前，父设备在后）
     let functions = nvidia_functions_desc(&pci_id)?;
 
+    // 固有 TOCTOU 窗口（仅文档化，不做双次扫描）：门禁 2 的 fd 扫描与下方
+    // unbind/remove 之间，新进程仍可能打开 /dev/nvidia* 使用 GPU——内核未提供
+    // 用户态"检查并占用"的原子原语，双次扫描同样存在窗口。极端竞态下进程
+    // 会在解绑/移除瞬间失败并返回 Err，不会静默报告成功。
     // 步骤1：解绑所有 NVIDIA 设备的驱动（失败时自动恢复已解绑设备）
     unbind_functions(&functions)?;
 
@@ -381,5 +398,38 @@ pub(super) fn auto_power() -> Result<(), FtoolError> {
         }
     } else {
         runtime_power_on()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_persistenced_comm;
+
+    #[test]
+    fn persistenced_comm_matches_full_and_kernel_truncated_name() {
+        // 编码 TASK_COMM_LEN=16 截断这一根因：内核把 /proc/<pid>/comm 截断
+        // 为最多 15 字符，"nvidia-persistenced"（19 字符）实际读作
+        // "nvidia-persiste"。此前按完整名比较恒为 false，persistenced 常驻
+        // 持有 /dev/nvidiactl 会被计入"运行中的进程"
+        let full = "nvidia-persistenced";
+        // TASK_COMM_LEN=16 含结尾 NUL → 用户态最多读到 15 个字符
+        let truncated = &full[..15];
+        assert_eq!(truncated, "nvidia-persiste");
+        assert!(is_persistenced_comm(full));
+        assert!(is_persistenced_comm(truncated));
+        // /proc/<pid>/comm 内容自带换行，读取后应经 trim 命中
+        assert!(is_persistenced_comm("nvidia-persiste\n"));
+    }
+
+    #[test]
+    fn persistenced_comm_rejects_ordinary_process_names() {
+        // 普通进程名（含空/纯空白）不得误判为 persistenced
+        for comm in ["gdm", "Xorg", "nvidia-smi", "", "   "] {
+            assert!(
+                !is_persistenced_comm(comm),
+                "comm={:?} 不应判定为 persistenced",
+                comm
+            );
+        }
     }
 }

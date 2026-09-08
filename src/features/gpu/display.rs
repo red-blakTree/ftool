@@ -6,6 +6,7 @@
 //! - systemd environment.d 的 NVIDIA 渲染环境变量；
 //! - PRIME 离散模式标志（/etc/prime-discrete，与 system76-power 约定一致）。
 
+use super::cleanup::content_has_ftool_marker;
 use super::file_io::create_file;
 use crate::core::FtoolError;
 use crate::core::runner::CommandRunner;
@@ -68,19 +69,36 @@ pub(super) fn write_dm_scripts() -> Result<(), FtoolError> {
     let igpu_provider = detect_igpu_xrandr_provider();
     let script = XRANDR_BRIDGE_SCRIPT.replacen("{}", &igpu_provider, 1);
 
-    // SDDM：仅当 Xsetup 尚非 ftool 生成且尚无备份时才备份原始文件（fs::copy
-    // 保留原始权限位），避免重复切换时把 ftool 脚本自身当成备份覆盖真正的
-    // 原始内容；随后始终以原子写覆盖为当前桥接脚本（幂等）
+    // SDDM：仅当 Xsetup 尚非 ftool 生成且尚无备份时才备份原始文件（保留原始
+    // 权限位），避免重复切换时把 ftool 脚本自身当成备份覆盖真正的原始内容；
+    // 随后始终以原子写覆盖为当前桥接脚本（幂等）
     if Path::new(SDDM_XSETUP_PATH).exists() {
         info!("检测到 SDDM，写入 xrandr 桥接脚本");
         let existing = fs::read(SDDM_XSETUP_PATH)
             .map_err(|e| FtoolError::Gpu(format!("读取 SDDM Xsetup 失败，无法安全写入: {}", e)))?;
-        let is_ftool_generated = existing.starts_with(FTOOL_MARKER.as_bytes());
+        let is_ftool_generated = content_has_ftool_marker(&existing);
         if !is_ftool_generated && !Path::new(SDDM_XSETUP_BAK_PATH).exists() {
-            fs::copy(SDDM_XSETUP_PATH, SDDM_XSETUP_BAK_PATH)
-                .map_err(|e| FtoolError::Gpu(format!("备份 SDDM Xsetup 失败: {}", e)))?;
+            // 备份先落到同目录临时路径、成功后 rename 原子落位：fs::copy 直接
+            // 写目标路径中途崩溃会留下半写 .bak，之后 cleanup 的 Restore 分支
+            // 会把半写内容当"原始备份"写回 Xsetup（思路同 file_io 的原子写）
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let tmp_bak = format!("{}.tmp.{}-{}", SDDM_XSETUP_BAK_PATH, std::process::id(), ts);
+            if let Err(e) = fs::copy(SDDM_XSETUP_PATH, &tmp_bak) {
+                let _ = fs::remove_file(&tmp_bak); // 清理可能残留的半写临时副本
+                return Err(FtoolError::Gpu(format!("备份 SDDM Xsetup 失败: {}", e)));
+            }
+            fs::rename(&tmp_bak, SDDM_XSETUP_BAK_PATH).map_err(|e| {
+                let _ = fs::remove_file(&tmp_bak);
+                FtoolError::Gpu(format!("备份 SDDM Xsetup 失败: {}", e))
+            })?;
         }
         create_file(SDDM_XSETUP_PATH, &script, true)?;
+    } else {
+        // 未安装 SDDM（Xsetup 由其包提供）属正常场景；提示以便排查外接显示器无输出
+        info!("未找到 SDDM Xsetup，跳过桥接脚本写入；如外接显示器无输出请检查");
     }
 
     // LightDM
@@ -105,29 +123,45 @@ const XRANDR_TIMEOUT_SECS: u64 = 5;
 /// 因此必须做白名单校验，仅接受常规 provider 名（字母/数字/下划线/连字符/点），
 /// 其余一律回退，杜绝异常输出演变为 root 上下文注入的可能。
 fn detect_igpu_xrandr_provider() -> String {
-    if let Ok(output) =
-        CommandRunner::run_with_timeout("xrandr", ["--listproviders"], XRANDR_TIMEOUT_SECS)
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            if line.contains("name:")
-                && !line.contains("NVIDIA")
-                && let Some(name_part) = line.split("name:").nth(1)
-            {
-                let name = name_part.trim();
-                if !name.is_empty()
-                    && name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-                {
-                    debug!("检测到 iGPU xrandr provider: {}", name);
-                    return name.to_string();
+    let provider =
+        match CommandRunner::run_with_timeout("xrandr", ["--listproviders"], XRANDR_TIMEOUT_SECS) {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut provider: Option<String> = None;
+                for line in stdout.lines() {
+                    if line.contains("name:")
+                        && !line.contains("NVIDIA")
+                        && let Some(name_part) = line.split("name:").nth(1)
+                    {
+                        let name = name_part.trim();
+                        if !name.is_empty()
+                            && name
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+                        {
+                            debug!("检测到 iGPU xrandr provider: {}", name);
+                            provider = Some(name.to_string());
+                            break;
+                        }
+                        debug!("跳过不含法的 xrandr provider 名称: {:?}", name);
+                    }
                 }
-                debug!("跳过不含法的 xrandr provider 名称: {:?}", name);
+                provider
             }
-        }
-    }
-    "modesetting".to_string()
+            Err(e) => {
+                // 正常场景也会走到（无 xrandr 或非 X11 会话等），仅 debug 说明回退原因
+                debug!(
+                    "运行 xrandr --listproviders 失败，回退到 modesetting; error={}",
+                    e
+                );
+                None
+            }
+        };
+    provider.unwrap_or_else(|| {
+        // 命令成功但未输出合法 provider 名（如仅有 NVIDIA provider 时）同样回退
+        debug!("xrandr --listproviders 未找到合法 iGPU provider 名称，回退到 modesetting");
+        "modesetting".to_string()
+    })
 }
 
 /// 写入 NVIDIA 独显模式环境变量配置

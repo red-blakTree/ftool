@@ -1,6 +1,6 @@
 use crate::core::FtoolError;
 use crate::features::gpu::constants::*;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -244,11 +244,15 @@ impl GpuDetector {
         // 避免在缓存损坏或 reset 清理后仍误报可切换。
         if has_igpu {
             if crate::features::gpu::cache::GpuCache::read().is_ok() {
-                info!("sysfs 未检测到 NVIDIA 但缓存有效，系统仍支持 GPU 切换");
+                info!(
+                    "sysfs 未检测到 NVIDIA 但缓存有效，系统仍支持 GPU 切换（基于缓存判断，若已移除 NVIDIA 硬件请执行 ftool -g reset）"
+                );
                 return Ok(true);
             }
             if Path::new(MODPROBE_GPU_PATH).exists() && Path::new(UDEV_INTEGRATED_PATH).exists() {
-                info!("sysfs 未检测到 NVIDIA 但存在 Integrated 残留配置，系统仍支持 GPU 切换");
+                info!(
+                    "sysfs 未检测到 NVIDIA 但存在 Integrated 残留配置，系统仍支持 GPU 切换（残留配置依据可能过期，若已移除 NVIDIA 硬件请执行 ftool -g reset）"
+                );
                 return Ok(true);
             }
         }
@@ -333,6 +337,12 @@ impl GpuDetector {
     /// 生成 nvidia-drm modeset=1 配置），不能作为 Hybrid 的判定特征；prime 标记
     /// 缺失/异常时保守归为 Nvidia，确保 power-off 门禁不会在 NVIDIA 驱动显示
     /// 输出时被误判为 Hybrid 而放行。
+    ///
+    /// prime-discrete="off"（切换到 Integrated 时写入的合法值）同样没有显式
+    /// 分支：切换后未重启的过渡窗口内 nvidia 模块仍加载而 prime 已标记 off，
+    /// 与标记缺失一样落入保守兜底归为 Nvidia——该窗口内 GPU 确实仍被驱动
+    /// 使用，保守归 Nvidia 才能让 power-off 门禁不放行；重启后模块卸载自然
+    /// 归为 Integrated。此为保守安全设计，不是缺陷。
     fn classify_mode(nvidia_loaded: bool, prime_mode: &str, is_integrated: bool) -> super::GpuMode {
         // NVIDIA 模块未加载 → Integrated
         // （无论 nouveau 是否加载、是否存在 Integrated 配置残留）
@@ -367,7 +377,12 @@ impl GpuDetector {
 
     /// 获取 NVIDIA GPU 的原始 PCI 设备 ID（如 "0000:01:00.0"），用于运行时电源控制
     pub fn get_nvidia_raw_pci_id() -> Result<String, FtoolError> {
-        let (nvidia_gpus, _, _) = Self::detect_all_gpus()?;
+        let (mut nvidia_gpus, _, _) = Self::detect_all_gpus()?;
+        // read_dir 枚举顺序无保证：按 PCI 地址排序（pci_id 为定宽字符串
+        // "DDDD:BB:DD.F"，字典序即总线序）取首个设备，与 gpu_supports_runtimepm
+        // 的选择保持一致，避免多 NVIDIA 设备（内置 dGPU + eGPU）时两个函数
+        // 因枚举顺序不同而选中不同的 GPU
+        nvidia_gpus.sort_by(|a, b| a.pci_id.cmp(&b.pci_id));
         nvidia_gpus
             .first()
             .map(|gpu| gpu.pci_id.clone())
@@ -375,12 +390,17 @@ impl GpuDetector {
     }
 
     /// 检测 NVIDIA GPU 是否在线（sysfs 中至少存在一个 NVIDIA 显示设备）
+    ///
+    /// 检测失败时不静默：输出 error 日志并按"不在线"返回。runtime_power_off
+    /// 取不到 PCI ID 后会依赖本函数的 false 幂等放行（视为已关闭），error
+    /// 日志用于把"检测失败"与"确实已关闭"区分开；调用方在返回值上仍无法
+    /// 区分二者，如需严格区分须把签名改为返回 Result（涉及 power.rs 等调用
+    /// 方一并调整），留待后续。
     pub fn is_nvidia_online() -> bool {
-        // 检测失败不能静默当作"已关闭"（runtime_power_off 的幂等判断依赖此区分）
         match Self::detect_all_gpus() {
             Ok((nvidia_gpus, _, _)) => !nvidia_gpus.is_empty(),
             Err(e) => {
-                warn!("检测 NVIDIA GPU 在线状态失败，按不在线处理: {}", e);
+                error!("检测 NVIDIA GPU 在线状态失败，按不在线处理: {}", e);
                 false
             }
         }
@@ -550,6 +570,12 @@ impl GpuDetector {
         let vendor = Self::get_vendor_string();
         let product = Self::get_product_string();
 
+        // 已知行为（自证闭环，刻意不改）：System76 机器已处于 Integrated 时
+        // NVIDIA 已被 udev 移除、sysfs 检测不到 GPU，gpu_supports_runtimepm
+        // 返回 false → 这里推荐 Integrated。即"检测不到 GPU 便无法证明支持
+        // runtimepm"，对已 Integrated 的机器只会重复推荐 Integrated、不会
+        // 凭空建议 Hybrid（保守安全方向）；若要打破闭环，需在 GPU 不在线时
+        // 借助缓存中的设备 ID 查询 supported-gpus.json，留待后续。
         let runtimepm = match Self::gpu_supports_runtimepm() {
             Ok(ok) => ok,
             Err(err) => {
