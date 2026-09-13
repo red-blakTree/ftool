@@ -13,13 +13,25 @@ const PRIVATE_KEY: &str = "/etc/pki/akmods/private/private_key.priv";
 /// 内核签名公钥路径
 const PUBLIC_KEY: &str = "/etc/pki/akmods/certs/public_key.pem";
 
+/// 内核既有签名的探测结果（当前公钥的签名已在校验阶段排除）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignatureState {
+    /// 已持有非当前公钥的签名
+    Foreign,
+    /// 确认不存在签名表
+    Absent,
+    /// 探测失败，无法判定
+    Unknown,
+}
+
 /// 内核签名工具（使用 sbsign）
 pub struct KernelSigner;
 
 impl KernelSigner {
     /// 确保 sbsign 命令可用，不可用时自动安装 sbsigntools
     fn ensure_sbsign_available() -> Result<(), FtoolError> {
-        let status = CommandRunner::run_status("which", [OsStr::new("sbsign")])?;
+        // 捕获输出而非继承到终端：`which` 会把命令路径直接打给用户（探测噪声）
+        let status = CommandRunner::run("which", [OsStr::new("sbsign")])?.status;
         if status.success() {
             return Ok(());
         }
@@ -40,7 +52,7 @@ impl KernelSigner {
                 "自动安装 sbsigntools 失败，请检查网络或确认是否有 root 权限".into(),
             ));
         }
-        let recheck = CommandRunner::run_status("which", [OsStr::new("sbsign")])?;
+        let recheck = CommandRunner::run("which", [OsStr::new("sbsign")])?.status;
         if !recheck.success() {
             return Err(FtoolError::Sign(
                 "sbsigntools 安装完成，但仍未找到 sbsign 命令".into(),
@@ -61,25 +73,79 @@ impl KernelSigner {
         Ok(())
     }
 
-    /// 使用当前公钥执行 sbverify 校验；`Ok(true)` 表示校验通过。
+    /// 使用当前公钥执行 sbverify 校验，返回 `(是否通过, 诊断信息)`。
     ///
-    /// 校验工具本身执行失败时返回 `Err`——此时不应盲目继续签名/替换，
+    /// 校验工具本身无法启动时返回 `Err`——此时不应盲目继续签名/替换，
     /// 避免在验证链路已损坏的情况下仍输出"签名完成"。
-    fn sbverify_passes(path: &Path) -> Result<bool, FtoolError> {
-        match CommandRunner::run_status(
+    ///
+    /// WHY 捕获输出：sbverify 在"无签名表/签名不匹配"这类常规结论下也会把底层
+    /// 告警（如 `No signature table present`）打到终端并以非零码退出。继承 stdio
+    /// 会把"内核尚未签名"的例行检查渲染成一次显式失败，误导用户以为出了故障。
+    /// 诊断信息仅在确需报错时（签名产物校验失败）随错误消息带出。
+    fn sbverify_check(path: &Path) -> Result<(bool, String), FtoolError> {
+        let output = CommandRunner::run(
             "sbverify",
             [
                 OsStr::new("--cert"),
                 OsStr::new(PUBLIC_KEY),
                 path.as_os_str(),
             ],
-        ) {
-            Ok(status) => Ok(status.success()),
-            Err(e) => Err(FtoolError::Sign(format!(
-                "无法执行 sbverify 校验 {}: {e}",
-                path.display()
-            ))),
+        )
+        .map_err(|e| FtoolError::Sign(format!("无法执行 sbverify 校验 {}: {e}", path.display())))?;
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
         }
+        .to_string();
+
+        Ok((output.status.success(), detail))
+    }
+
+    /// 探测内核既有签名的状态（不校验），用于覆盖前告警。
+    ///
+    /// WHY 用 `sbverify --list` 而不是 `--cert`：实测 sbsigntools 0.9.5 对「无签名表」
+    /// 与「签名属于其他密钥」的 `--cert` 退出码与 stdout 完全一致（exit 1 +
+    /// `Signature verification failed`，仅 stderr 文案不同），不足以区分；
+    /// `--list` 只列签名，据此判断镜像里有没有签名表。
+    ///
+    /// 探测命令无法启动时返回 `Err`（验证链路已损坏，与 [`Self::sbverify_check`]
+    /// 一致地不盲目继续）；镜像不是 PE 等非零退出只告警并按「无法判定」继续。
+    fn signature_state(path: &Path) -> Result<SignatureState, FtoolError> {
+        let output = CommandRunner::run("sbverify", [OsStr::new("--list"), path.as_os_str()])
+            .map_err(|e| {
+                FtoolError::Sign(format!(
+                    "无法执行 sbverify --list 探测 {}: {e}",
+                    path.display()
+                ))
+            })?;
+        // 非零退出（如镜像不是 PE）不阻断签名主流程：只记 warn 日志并按「无法判定」
+        // 继续，不产生「已有其他签名」的假告警；调用方据 Unknown 改用中性文案
+        if !output.status.success() {
+            warn!(
+                "sbverify --list 探测失败（退出码 {:?}），无法判定是否已有其他签名: {}",
+                output.status.code(),
+                path.display()
+            );
+            return Ok(SignatureState::Unknown);
+        }
+        Ok(if Self::listing_has_signature(&output.stdout) {
+            SignatureState::Foreign
+        } else {
+            SignatureState::Absent
+        })
+    }
+
+    /// 判据：`sbverify --list` 的 stdout 是否列出了签名。
+    ///
+    /// WHY 只看 stdout：实测 sbsigntools 0.9.5 对无签名表的镜像同样以 0 退出，
+    /// 只把 `No signature table present` 写到 stderr；签名列表才写 stdout。
+    /// 故「镜像是否已有签名」既不能靠退出码、也不能靠 stderr 文本判断。
+    fn listing_has_signature(stdout: &[u8]) -> bool {
+        !String::from_utf8_lossy(stdout).trim().is_empty()
     }
 
     /// 提交阶段（原文件已移为备份后）任一步骤失败的统一收尾：
@@ -200,9 +266,27 @@ impl KernelSigner {
         })?;
 
         // 幂等性检查：如果已经签名，直接跳过
-        if Self::sbverify_passes(&real_path)? {
+        let (already_signed, _) = Self::sbverify_check(&real_path)?;
+        if already_signed {
             println!("⏭️ 内核已持有当前公钥的签名，跳过: {}", real_path.display());
             return Ok(());
+        }
+        // 未持有当前公钥的签名时，再区分「完全没签名」「非当前公钥的签名」「探测失败」：
+        // 第二种继续会覆盖掉既有签名、必须在确认前明确告知；第三种不能断言「未持有」，
+        // 只能说无法确认（此前这几种情况都静默放行，不提示会覆盖掉别人的签名）
+        match Self::signature_state(&real_path)? {
+            SignatureState::Foreign => println!(
+                "⚠️ 内核已存在非当前公钥的签名，继续将覆盖该签名: {}",
+                real_path.display()
+            ),
+            SignatureState::Absent => {
+                println!("🔓 内核未持有当前公钥的签名: {}", real_path.display());
+            }
+            // 探测失败时不断言「未持有」——那正是本次要修的那类未证实断言
+            SignatureState::Unknown => println!(
+                "⚠️ 无法确认内核是否已有其他签名（探测失败），继续将覆盖原文件: {}",
+                real_path.display()
+            ),
         }
 
         // 覆盖引导文件是不可逆操作，非交互终端（脚本/cron）直接中止：
@@ -215,7 +299,7 @@ impl KernelSigner {
         }
         if !Prompter::ask_yes(
             &format!(
-                "即将覆盖签名内核文件: {}\n是否继续？ [y/N]: ",
+                "即将签名内核文件并覆盖原文件: {}\n是否继续？ [y/N]: ",
                 real_path.display()
             ),
             false,
@@ -279,13 +363,20 @@ impl KernelSigner {
         // 防符号链接竞态第二道校验：签名完成后确认 tmp 仍是普通文件再继续提交
         Self::ensure_tmp_regular(tmp)?;
         // 替换前校验签名产物，避免把损坏/无效的产物覆盖到引导文件上
-        if !Self::sbverify_passes(tmp).inspect_err(|_| {
+        let (verified, detail) = Self::sbverify_check(tmp).inspect_err(|_| {
             let _ = fs::remove_file(tmp);
-        })? {
+        })?;
+        if !verified {
             let _ = fs::remove_file(tmp);
-            return Err(FtoolError::Sign(
-                "签名产物未通过 sbverify 校验，已保留原内核文件".into(),
-            ));
+            // 诊断信息已不再继承到终端，必须随错误带出，否则失败原因不可见
+            return Err(FtoolError::Sign(format!(
+                "签名产物未通过 sbverify 校验，已保留原内核文件{}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            )));
         }
 
         // 确保签名产物落盘，缩小断电留下空/损坏文件的窗口
@@ -427,6 +518,20 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    // ---------- 签名探测判据：区分「无签名」与「其他密钥的签名」 ----------
+
+    /// WHY: sbsigntools 0.9.5 对无签名表的镜像执行 `--list` 同样返回 0，只把
+    /// `No signature table present` 写到 stderr——若以退出码或 stderr 文本判断，
+    /// 未签名的内核会被误判为「已被其他密钥签名」并给出假告警
+    #[test]
+    fn listing_has_signature_ignores_stderr_only_notice() {
+        assert!(!KernelSigner::listing_has_signature(b""));
+        assert!(!KernelSigner::listing_has_signature(b" \n\t\n"));
+        assert!(KernelSigner::listing_has_signature(
+            b"signature 1\nimage signature issuers:\n - /CN=probe1\n"
+        ));
     }
 
     // ---------- 临时输出占位文件：符号链接竞态缓解 ----------
