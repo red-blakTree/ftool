@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "ftool"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "digest",
  "env_logger",
