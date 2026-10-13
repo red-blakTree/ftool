@@ -40,9 +40,21 @@ pub(super) fn runtime_power_on() -> Result<(), FtoolError> {
         std::thread::sleep(std::time::Duration::from_millis(300));
     };
 
-    // 等驱动绑定完成后设置电源管理（参考 system76-power 的做法）
-    let mode = GpuDetector::query_current_mode();
-    apply_power_control(&pci_id, mode)?;
+    // 仅 coreboot 主板需要在此设置 power/control：其固件缺少 DGPU_PWRGD 修复，
+    // 驱动初始化完成前启用自动电源管理会导致系统锁死；其他主板的 power/control
+    // 由 nvidia-drivers 的 udev 规则在驱动 bind 时设置。
+    // 参考 system76-power set_power：该 hack 已限定为仅 coreboot 主板
+    let bios_vendor = fs::read_to_string("/sys/class/dmi/id/bios_vendor")
+        .map_err(|e| FtoolError::Gpu(format!("读取 bios_vendor 失败: {}", e)))?;
+    if bios_vendor.trim() == "coreboot" {
+        let mode = GpuDetector::query_current_mode();
+        apply_power_control(&pci_id, mode)?;
+    } else {
+        info!(
+            "BIOS 厂商为 {}，跳过 power/control 设置（由 udev 规则负责）",
+            bios_vendor.trim()
+        );
+    }
     Ok(())
 }
 

@@ -76,6 +76,7 @@ const EXTERNAL_DISPLAY_REQUIRES_NVIDIA: &[&str] = &[
     "addw3",
     "addw4",
     "addw5",
+    "addp6",
     "bonw15",
     "bonw15-b",
     "bonw16",
@@ -99,6 +100,7 @@ const EXTERNAL_DISPLAY_REQUIRES_NVIDIA: &[&str] = &[
     "oryp11",
     "oryp12",
     "oryp13",
+    "oryp14",
     "serw13",
     "serw14",
 ];
@@ -506,12 +508,15 @@ impl GpuDetector {
             .map_err(|e| FtoolError::Gpu(format!("读取 /usr/share/doc 失败: {}", e)))?
             .filter_map(Result::ok)
             .map(|f| f.path())
-            // 兼容不同发行版的驱动文档目录命名：Ubuntu/Pop!_OS 的 nvidia-driver-<ver>，
-            // Fedora rpmfusion 的 xorg-x11-drv-nvidia-<ver>（是否附带该 JSON 以目标
-            // 环境实测为准，此处至少保证两种布局都能被扫描到）
+            // 兼容不同发行版的驱动文档目录命名：Ubuntu/Pop!_OS 的 nvidia-driver-<ver>、
+            // 其过渡包 nvidia-kernel-common-<ver>（该 JSON 的实际提供者，参考
+            // system76-power 的对应修复）、Fedora rpmfusion 的 xorg-x11-drv-nvidia-<ver>
+            // （是否附带该 JSON 以目标环境实测为准）
             .filter(|f| {
                 let name = f.to_str().unwrap_or_default();
-                name.contains("nvidia-driver-") || name.contains("xorg-x11-drv-nvidia")
+                name.contains("nvidia-driver-")
+                    || name.contains("nvidia-kernel-common")
+                    || name.contains("xorg-x11-drv-nvidia")
             })
             .map(|f| f.join("supported-gpus.json"))
             .filter(|f| f.exists())
